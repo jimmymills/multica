@@ -1,5 +1,5 @@
 import { v7 as uuidv7 } from "uuid";
-import { Agent as CoreAgent } from "../agent/agent.js";
+import { Agent as CoreAgent } from "../agent/runner.js";
 import { Channel } from "./channel.js";
 import type { Message } from "./types.js";
 

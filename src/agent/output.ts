@@ -1,24 +1,14 @@
-import { Agent as PiAgentCore, type AgentEvent, type AgentMessage, type ThinkingLevel } from "@mariozechner/pi-agent-core";
-import { getModel } from "@mariozechner/pi-ai";
-import { createCodingTools } from "@mariozechner/pi-coding-agent";
+import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
 
-export type AgentRunResult = {
-  text: string;
-  error?: string;
+export type AgentOutputState = {
+  lastAssistantText: string;
+  printedLen: number;
+  streaming: boolean;
 };
 
-export type AgentLogger = {
-  stdout?: NodeJS.WritableStream;
-  stderr?: NodeJS.WritableStream;
-};
-
-export type AgentOptions = {
-  provider?: string;
-  model?: string;
-  systemPrompt?: string;
-  thinkingLevel?: ThinkingLevel;
-  cwd?: string;
-  logger?: AgentLogger;
+export type AgentOutput = {
+  state: AgentOutputState;
+  handleEvent: (event: AgentEvent) => void;
 };
 
 function extractText(message: AgentMessage | undefined): string {
@@ -74,50 +64,27 @@ function formatToolLine(name: string, args: unknown): string {
   return argText ? `• Used ${title} (${argText})` : `• Used ${title}`;
 }
 
-export class Agent {
-  private readonly agent: PiAgentCore;
-  private readonly stdout: NodeJS.WritableStream;
-  private readonly stderr: NodeJS.WritableStream;
-  private lastAssistantText = "";
-  private printedLen = 0;
-  private streaming = false;
+export function createAgentOutput(params: {
+  stdout: NodeJS.WritableStream;
+  stderr: NodeJS.WritableStream;
+}): AgentOutput {
+  const state: AgentOutputState = {
+    lastAssistantText: "",
+    printedLen: 0,
+    streaming: false,
+  };
 
-  constructor(options: AgentOptions = {}) {
-    this.stdout = options.logger?.stdout ?? process.stdout;
-    this.stderr = options.logger?.stderr ?? process.stderr;
-
-    this.agent = new PiAgentCore();
-    if (options.systemPrompt) this.agent.setSystemPrompt(options.systemPrompt);
-    if (options.thinkingLevel) this.agent.setThinkingLevel(options.thinkingLevel);
-
-    if (options.provider && options.model) {
-      this.agent.setModel(getModel(options.provider, options.model));
-    } else {
-      this.agent.setModel(getModel("kimi-coding", "kimi-k2-thinking"));
-    }
-
-    const cwd = options.cwd ?? process.cwd();
-    this.agent.setTools(createCodingTools(cwd));
-    this.agent.subscribe((event) => this.handleEvent(event));
-  }
-
-  async run(prompt: string): Promise<AgentRunResult> {
-    this.lastAssistantText = "";
-    await this.agent.prompt(prompt);
-    return { text: this.lastAssistantText, error: this.agent.state.error };
-  }
-
-  private handleEvent(event: AgentEvent) {
+  const handleEvent = (event: AgentEvent) => {
     switch (event.type) {
       case "message_start": {
         const msg = event.message;
         if (msg.role === "assistant") {
-          this.streaming = true;
-          this.printedLen = 0;
+          state.streaming = true;
+          state.printedLen = 0;
           const text = extractText(msg);
           if (text.length > 0) {
-            this.stdout.write(text);
-            this.printedLen = text.length;
+            params.stdout.write(text);
+            state.printedLen = text.length;
           }
         }
         break;
@@ -126,9 +93,9 @@ export class Agent {
         const msg = event.message;
         if (msg.role === "assistant") {
           const text = extractText(msg);
-          if (text.length > this.printedLen) {
-            this.stdout.write(text.slice(this.printedLen));
-            this.printedLen = text.length;
+          if (text.length > state.printedLen) {
+            params.stdout.write(text.slice(state.printedLen));
+            state.printedLen = text.length;
           }
         }
         break;
@@ -137,27 +104,29 @@ export class Agent {
         const msg = event.message;
         if (msg.role === "assistant") {
           const text = extractText(msg);
-          if (text.length > this.printedLen) {
-            this.stdout.write(text.slice(this.printedLen));
-            this.printedLen = text.length;
+          if (text.length > state.printedLen) {
+            params.stdout.write(text.slice(state.printedLen));
+            state.printedLen = text.length;
           }
-          if (this.streaming) this.stdout.write("\n");
-          this.streaming = false;
-          this.lastAssistantText = text;
+          if (state.streaming) params.stdout.write("\n");
+          state.streaming = false;
+          state.lastAssistantText = text;
         }
         break;
       }
       case "tool_execution_start":
-        this.stderr.write(`${formatToolLine(event.toolName, event.args)}\n`);
+        params.stderr.write(`${formatToolLine(event.toolName, event.args)}\n`);
         break;
       case "tool_execution_end":
         if (event.isError) {
           const errorText = extractText(event.result) || "Tool failed";
-          this.stderr.write(`• Tool error (${toolDisplayName(event.toolName)}): ${errorText}\n`);
+          params.stderr.write(`• Tool error (${toolDisplayName(event.toolName)}): ${errorText}\n`);
         }
         break;
       default:
         break;
     }
-  }
+  };
+
+  return { state, handleEvent };
 }

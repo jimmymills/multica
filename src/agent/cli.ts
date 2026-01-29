@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { Agent } from "./agent.js";
+import { Agent } from "./runner.js";
 
 type CliOptions = {
   provider?: string;
