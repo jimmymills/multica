@@ -4,7 +4,7 @@ import {
   HelloResponseAction,
   type HelloPayload,
   type HelloResponsePayload,
-} from "../shared/gateway-sdk/index.js";
+} from "@multica/sdk";
 
 // 模拟一个 Client
 const client = new GatewayClient({

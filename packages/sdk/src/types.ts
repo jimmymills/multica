@@ -1,53 +1,53 @@
-/** WebSocket 事件名称 */
+/** WebSocket event names */
 export const GatewayEvents = {
-  // 系统事件
+  // System events
   PING: "ping",
   PONG: "pong",
   REGISTERED: "registered",
 
-  // 消息路由
+  // Message routing
   SEND: "send",
   RECEIVE: "receive",
   SEND_ERROR: "send_error",
 } as const;
 
-// ============ 设备相关 ============
+// ============ Device Related ============
 
-/** 设备类型 */
+/** Device type */
 export type DeviceType = "client" | "agent";
 
-/** 设备信息 */
+/** Device information */
 export interface DeviceInfo {
   deviceId: string;
   deviceType: DeviceType;
 }
 
-/** 注册响应 */
+/** Registration response */
 export interface RegisteredResponse {
   success: boolean;
   deviceId: string;
   error?: string;
 }
 
-// ============ 消息路由 ============
+// ============ Message Routing ============
 
-/** 路由消息 */
+/** Routed message */
 export interface RoutedMessage<T = unknown> {
-  /** 消息唯一ID (UUID v7，包含时间戳) */
+  /** Unique message ID (UUID v7, contains timestamp) */
   id: string;
-  /** 用户ID（登录后填充） */
+  /** User ID (populated after login) */
   uid: string | null;
-  /** 发送者 deviceId */
+  /** Sender deviceId */
   from: string;
-  /** 接收者 deviceId */
+  /** Recipient deviceId */
   to: string;
-  /** 动作类型 */
+  /** Action type */
   action: string;
-  /** 消息内容 */
+  /** Message payload */
   payload: T;
 }
 
-/** 发送失败响应 */
+/** Send failure response */
 export interface SendErrorResponse {
   messageId: string;
   error: string;
@@ -56,43 +56,43 @@ export interface SendErrorResponse {
 
 // ============ Ping/Pong ============
 
-/** Ping 请求 */
+/** Ping request */
 export interface PingPayload {
   [key: string]: unknown;
 }
 
-/** Ping 响应 */
+/** Ping response */
 export interface PongResponse {
   event: string;
   data: string;
 }
 
-// ============ 客户端配置 ============
+// ============ Client Configuration ============
 
-/** 连接配置 */
+/** Connection configuration */
 export interface GatewayClientOptions {
-  /** 服务器地址，如 http://localhost:3000 */
+  /** Server address, e.g. http://localhost:3000 */
   url: string;
-  /** WebSocket 路径，默认 /ws */
+  /** WebSocket path, defaults to /ws */
   path?: string | undefined;
-  /** 设备ID */
+  /** Device ID */
   deviceId: string;
-  /** 设备类型 */
+  /** Device type */
   deviceType: DeviceType;
-  /** 自动重连，默认 true */
+  /** Auto reconnect, defaults to true */
   autoReconnect?: boolean | undefined;
-  /** 重连延迟（毫秒），默认 1000 */
+  /** Reconnect delay (milliseconds), defaults to 1000 */
   reconnectDelay?: number | undefined;
 }
 
-/** 连接状态 */
+/** Connection state */
 export type ConnectionState =
   | "disconnected"
   | "connecting"
   | "connected"
   | "registered";
 
-/** 事件回调类型 */
+/** Event callback types */
 export interface GatewayClientCallbacks {
   onConnect?: (socketId: string) => void;
   onDisconnect?: (reason: string) => void;
@@ -103,4 +103,3 @@ export interface GatewayClientCallbacks {
   onError?: (error: Error) => void;
   onStateChange?: (state: ConnectionState) => void;
 }
-

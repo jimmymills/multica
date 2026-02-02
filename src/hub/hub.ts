@@ -1,8 +1,7 @@
 import type { HubOptions } from "./types.js";
-import type { ConnectionState } from "../shared/gateway-sdk/types.js";
+import { GatewayClient, type ConnectionState } from "@multica/sdk";
 import { AsyncAgent } from "../agent/async-agent.js";
 import { getHubId } from "./hub-identity.js";
-import { GatewayClient } from "../shared/gateway-sdk/client.js";
 import { loadAgentRecords, addAgentRecord, removeAgentRecord } from "./agent-store.js";
 
 export class Hub {

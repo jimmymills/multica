@@ -21,7 +21,7 @@ import {
   type PongResponse,
   type DeviceInfo,
   type DeviceType,
-} from "../shared/gateway-sdk/index.js";
+} from "@multica/sdk";
 
 @Injectable()
 @WebSocketGateway({

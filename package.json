@@ -42,6 +42,7 @@
     "vitest": "^4.0.18"
   },
   "dependencies": {
+    "@multica/sdk": "workspace:*",
     "@mariozechner/pi-agent-core": "^0.50.3",
     "@mariozechner/pi-ai": "^0.50.3",
     "@mariozechner/pi-coding-agent": "^0.50.3",
