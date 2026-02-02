@@ -258,12 +258,6 @@ importers:
         specifier: 'catalog:'
         version: 5.9.3
 
-  packages/fetch:
-    devDependencies:
-      typescript:
-        specifier: 'catalog:'
-        version: 5.9.3
-
   packages/sdk:
     dependencies:
       socket.io-client:
