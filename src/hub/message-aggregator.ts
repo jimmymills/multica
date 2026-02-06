@@ -68,7 +68,7 @@ export class MessageAggregator {
         return;
 
       case "message_end":
-        this.flushBuffer();
+        this.handleMessageEnd(event as AgentEvent & { type: "message_end" });
         this.onPassthrough(event);
         return;
 
@@ -87,13 +87,7 @@ export class MessageAggregator {
   private handleMessageUpdate(event: AgentEvent): void {
     const message = (event as { message?: unknown }).message;
     const currentText = extractText(message as Parameters<typeof extractText>[0]);
-
-    // Compute incremental delta (monotonic accumulation)
-    if (currentText.length <= this.previousText.length) return;
-    const delta = currentText.slice(this.previousText.length);
-
-    this.previousText = currentText;
-    this.buffer += delta;
+    this.appendDelta(currentText);
 
     // Try to emit chunks from buffer
     let result = this.chunker.tryChunk(this.buffer);
@@ -102,6 +96,22 @@ export class MessageAggregator {
       this.buffer = result.remainder;
       result = this.chunker.tryChunk(this.buffer);
     }
+  }
+
+  private handleMessageEnd(event: AgentEvent): void {
+    const message = (event as { message?: unknown }).message;
+    const currentText = extractText(message as Parameters<typeof extractText>[0]);
+    this.appendDelta(currentText);
+    this.flushBuffer();
+  }
+
+  private appendDelta(currentText: string): void {
+    // Compute incremental delta (monotonic accumulation)
+    if (currentText.length <= this.previousText.length) return;
+    const delta = currentText.slice(this.previousText.length);
+
+    this.previousText = currentText;
+    this.buffer += delta;
   }
 
   private flushBuffer(): void {
