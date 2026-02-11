@@ -9,6 +9,15 @@ export type SessionMeta = {
   reasoningMode?: string;
   /** Context window token 数 */
   contextWindowTokens?: number;
+  /** Internal finance evidence decision from the latest run */
+  researchDecision?: {
+    domain: "finance";
+    plan: "data_only" | "hybrid" | "web_first";
+    marketRoute: "secondary" | "primary_with_ticker" | "primary_no_ticker";
+    confidencePenalty: "low" | "medium" | "high";
+    reasons: string[];
+    timestamp: number;
+  } | undefined;
 };
 
 export type SessionEntry =
