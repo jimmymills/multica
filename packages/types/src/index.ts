@@ -190,3 +190,15 @@ export interface ExecApprovalRequest {
   riskReasons: string[]
   expiresAtMs: number
 }
+
+// ============================================================================
+// Auth Types
+// ============================================================================
+
+export interface AuthUser {
+  uid: string
+  name: string
+  email?: string
+  icon?: string
+  vip?: number
+}
