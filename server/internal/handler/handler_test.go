@@ -45,7 +45,7 @@ func TestMain(m *testing.M) {
 	queries := db.New(pool)
 	hub := realtime.NewHub()
 	go hub.Run()
-	bus := events.NewBus()
+	bus := events.New()
 	testHandler = New(queries, pool, hub, bus)
 	testPool = pool
 

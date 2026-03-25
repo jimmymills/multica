@@ -61,7 +61,7 @@ func TestMain(m *testing.M) {
 	hub := realtime.NewHub()
 	go hub.Run()
 
-	bus := events.NewBus()
+	bus := events.New()
 	router := NewRouter(pool, hub, bus)
 	testServer = httptest.NewServer(router)
 
