@@ -94,7 +94,8 @@ Browser ← WSClient (shared/api) ← WebSocket ← Hub.Broadcast() ← Handlers
 - **Daemon** (`internal/daemon/`): Local agent runtime — auto-detects available CLIs (claude, codex), registers runtimes, polls for tasks, routes by provider.
 - **CLI** (`internal/cli/`): Shared helpers for the `multica` CLI — API client, config management, output formatting.
 - **Events** (`internal/events/`): Internal event bus for decoupled communication between handlers and services.
-- **Database**: sqlc generates Go code from SQL in `pkg/db/queries/` → `pkg/db/generated/`. Migrations in `migrations/`.
+- **Logging** (`internal/logger/`): Structured logging via slog. `LOG_LEVEL` env var controls level (debug, info, warn, error).
+- **Database**: PostgreSQL with pgvector extension (`pgvector/pgvector:pg17`). sqlc generates Go code from SQL in `pkg/db/queries/` → `pkg/db/generated/`. Migrations in `migrations/`.
 - **Routes** (`cmd/server/router.go`): Public routes (auth, health, ws) + protected routes (require JWT) + daemon routes (unauthenticated, separate auth model).
 
 ### Multi-tenancy
@@ -119,11 +120,14 @@ pnpm install
 pnpm dev:web          # Next.js dev server (port 3000)
 pnpm build            # Build frontend
 pnpm typecheck        # TypeScript check
+pnpm lint             # ESLint via Next.js
 pnpm test             # TS tests (Vitest)
 
 # Backend (Go)
 make dev              # Run Go server (port 8080)
 make daemon           # Run local daemon
+make build            # Build server + CLI binaries to server/bin/
+make cli ARGS="..."   # Run multica CLI (e.g. make cli ARGS="config")
 make test             # Go tests
 make sqlc             # Regenerate sqlc code after editing SQL in server/pkg/db/queries/
 make migrate-up       # Run database migrations
@@ -139,9 +143,13 @@ pnpm --filter @multica/web exec vitest run src/path/to/file.test.ts
 pnpm exec playwright test e2e/tests/specific-test.spec.ts
 
 # Infrastructure
-make db-up            # Start shared PostgreSQL
+make db-up            # Start shared PostgreSQL (pgvector/pg17 image)
 make db-down          # Stop shared PostgreSQL
 ```
+
+### CI Requirements
+
+CI runs on Node 22 and Go 1.24 with a `pgvector/pgvector:pg17` PostgreSQL service. See `.github/workflows/ci.yml`.
 
 ### Worktree Support
 
