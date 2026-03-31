@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { MoreHorizontal } from "lucide-react";
+import { Copy, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -103,7 +103,7 @@ function CommentRow({
           </TooltipContent>
         </Tooltip>
 
-        {!isTemp && isOwn && (
+        {!isTemp && (
           <DropdownMenu>
             <DropdownMenuTrigger
               render={
@@ -113,11 +113,27 @@ function CommentRow({
               }
             />
             <DropdownMenuContent align="end">
-              <DropdownMenuItem onClick={startEdit}>Edit</DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={() => onDelete(entry.id)} variant="destructive">
-                Delete
+              <DropdownMenuItem onClick={() => {
+                navigator.clipboard.writeText(entry.content ?? "");
+                toast.success("Copied");
+              }}>
+                <Copy className="h-3.5 w-3.5" />
+                Copy
               </DropdownMenuItem>
+              {isOwn && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={startEdit}>
+                    <Pencil className="h-3.5 w-3.5" />
+                    Edit
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => onDelete(entry.id)} variant="destructive">
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Delete
+                  </DropdownMenuItem>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         )}
