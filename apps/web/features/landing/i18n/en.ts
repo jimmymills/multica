@@ -273,6 +273,22 @@ export const en: LandingDict = {
     subtitle: "New updates and improvements to Multica.",
     entries: [
       {
+        version: "0.1.6",
+        date: "2026-04-03",
+        title: "Editor Overhaul & Agent Lifecycle",
+        changes: [
+          "Unified Tiptap editor with a single Markdown pipeline for editing and display",
+          "Reliable Markdown paste, inline code spacing, and link styling",
+          "Agent archive and restore — soft delete replaces hard delete",
+          "Archived agents hidden from default agent list",
+          "Skeleton loading states, error toasts, and confirmation dialogs across the app",
+          "OpenCode added as a supported agent provider",
+          "Reply-triggered agent tasks now inherit thread-root @mentions",
+          "Granular real-time event handling for issues and inbox — no more full refetches",
+          "Unified image upload flow for paste and button in the editor",
+        ],
+      },
+      {
         version: "0.1.5",
         date: "2026-04-02",
         title: "Mentions & Permissions",

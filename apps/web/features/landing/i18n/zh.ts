@@ -273,6 +273,22 @@ export const zh: LandingDict = {
     subtitle: "Multica \u7684\u6700\u65b0\u66f4\u65b0\u548c\u6539\u8fdb\u3002",
     entries: [
       {
+        version: "0.1.6",
+        date: "2026-04-03",
+        title: "编辑器重构与 Agent 生命周期",
+        changes: [
+          "统一 Tiptap 编辑器，编辑和展示共用单一 Markdown 渲染管线",
+          "Markdown 粘贴、行内代码间距和链接样式修复",
+          "Agent 支持归档和恢复——软删除替代硬删除",
+          "默认列表隐藏已归档的 Agent",
+          "全应用新增骨架屏加载态、错误提示和确认对话框",
+          "新增 OpenCode 作为支持的 Agent 提供商",
+          "回复触发的 Agent 任务自动继承主线程 @提及",
+          "Issue 和收件箱实时事件细粒度处理，不再全量刷新",
+          "编辑器中统一图片上传流程，支持粘贴和按钮上传",
+        ],
+      },
+      {
         version: "0.1.5",
         date: "2026-04-02",
         title: "提及与权限",
