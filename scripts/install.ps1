@@ -128,18 +128,6 @@ function Add-ToUserPath {
     Write-Info "Added $Dir to user PATH (restart your terminal for other sessions to pick it up)."
 }
 
-function Install-CliScoop {
-    Write-Info "Installing Multica CLI via Scoop..."
-    try {
-        scoop bucket add multica https://github.com/multica-ai/scoop-bucket.git 2>$null
-        scoop install multica
-        Write-Ok "Multica CLI installed via Scoop"
-    } catch {
-        Write-Warn "Scoop install failed, falling back to direct download."
-        Install-CliBinary
-    }
-}
-
 function Install-Cli {
     if (Test-CommandExists "multica") {
         $currentVer = (multica version 2>$null) -replace '.*?(v[\d.]+).*','$1'
@@ -170,11 +158,7 @@ function Install-Cli {
         return
     }
 
-    if (Test-CommandExists "scoop") {
-        Install-CliScoop
-    } else {
-        Install-CliBinary
-    }
+    Install-CliBinary
 
     if (-not (Test-CommandExists "multica")) {
         Write-Fail "CLI installed but 'multica' not found on PATH. Restart your terminal and try again."
