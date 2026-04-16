@@ -63,16 +63,14 @@ function RunRow({ run }: { run: AutopilotRun }) {
   const cfg = (RUN_STATUS_CONFIG[run.status] ?? RUN_STATUS_CONFIG["issue_created"])!;
   const StatusIcon = cfg.icon;
 
-  return (
-    <div className="flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-accent/30 transition-colors">
+  const content = (
+    <>
       <StatusIcon className={cn("h-4 w-4 shrink-0", cfg.color)} />
       <span className={cn("w-24 shrink-0 text-xs font-medium", cfg.color)}>{cfg.label}</span>
       <span className="w-16 shrink-0 text-xs text-muted-foreground capitalize">{run.source}</span>
       <span className="flex-1 min-w-0 text-xs text-muted-foreground truncate">
         {run.issue_id ? (
-          <AppLink href={wsPaths.issueDetail(run.issue_id)} className="hover:underline">
-            Issue linked
-          </AppLink>
+          "Issue linked"
         ) : run.failure_reason ? (
           <span className="text-destructive">{run.failure_reason}</span>
         ) : null}
@@ -80,8 +78,20 @@ function RunRow({ run }: { run: AutopilotRun }) {
       <span className="w-32 shrink-0 text-right text-xs text-muted-foreground tabular-nums">
         {formatDate(run.triggered_at || run.created_at)}
       </span>
-    </div>
+    </>
   );
+
+  const rowClass = "flex items-center gap-3 px-4 py-2.5 text-sm hover:bg-accent/30 transition-colors";
+
+  if (run.issue_id) {
+    return (
+      <AppLink href={wsPaths.issueDetail(run.issue_id)} className={cn(rowClass, "cursor-pointer")}>
+        {content}
+      </AppLink>
+    );
+  }
+
+  return <div className={rowClass}>{content}</div>;
 }
 
 function TriggerRow({ trigger, autopilotId }: { trigger: AutopilotTrigger; autopilotId: string }) {
