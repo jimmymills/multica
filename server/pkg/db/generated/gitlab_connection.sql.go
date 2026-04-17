@@ -60,6 +60,21 @@ func (q *Queries) CreateWorkspaceGitlabConnection(ctx context.Context, arg Creat
 	return i, err
 }
 
+const deleteStaleConnectingGitlabConnection = `-- name: DeleteStaleConnectingGitlabConnection :exec
+DELETE FROM workspace_gitlab_connection
+WHERE workspace_id = $1
+  AND connection_status = 'connecting'
+  AND updated_at < now() - interval '10 minutes'
+`
+
+// Heals rows left in 'connecting' state by a server that died mid-sync.
+// A row is considered stale if it's been 'connecting' for longer than the
+// sync timeout (10 minutes is the timeout we set in the goroutine).
+func (q *Queries) DeleteStaleConnectingGitlabConnection(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteStaleConnectingGitlabConnection, workspaceID)
+	return err
+}
+
 const deleteUserGitlabConnection = `-- name: DeleteUserGitlabConnection :exec
 DELETE FROM user_gitlab_connection
 WHERE user_id = $1 AND workspace_id = $2

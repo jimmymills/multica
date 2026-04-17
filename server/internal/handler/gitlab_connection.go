@@ -45,6 +45,12 @@ func (h *Handler) ConnectGitlabWorkspace(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Heal stale 'connecting' rows from a server that died mid-sync.
+	if err := h.Queries.DeleteStaleConnectingGitlabConnection(r.Context(), parseUUID(workspaceID)); err != nil {
+		slog.Warn("heal stale connecting row failed", "error", err)
+		// Non-fatal — proceed; if the row genuinely conflicts we'll get 409 below.
+	}
+
 	var req connectGitlabRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -114,7 +120,13 @@ func (h *Handler) ConnectGitlabWorkspace(w http.ResponseWriter, r *http.Request)
 	// Use a fresh context — the request context will be cancelled before the
 	// sync finishes.
 	go func(token string, projectID int64, wsID string) {
-		syncCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		parent := h.BaseCtx
+		if parent == nil {
+			// Tests/embedded uses without explicit lifecycle ctx fall back to
+			// background so behavior matches Phase 2a's pre-shutdown plumbing.
+			parent = context.Background()
+		}
+		syncCtx, cancel := context.WithTimeout(parent, 10*time.Minute)
 		defer cancel()
 		if err := gitlabsync.RunInitialSync(syncCtx, gitlabsync.SyncDeps{
 			Queries: h.Queries,
