@@ -987,6 +987,16 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
+			// Enqueue an agent task when the persisted cache row resolved to an
+			// agent assignee. Runs AFTER the txn commits — task-enqueueing is
+			// a separate concern from the GitLab/DB write (matches legacy path
+			// tail: a failed enqueue must not roll back the created issue).
+			if cacheRow.AssigneeType.Valid && cacheRow.AssigneeID.Valid {
+				if h.shouldEnqueueAgentTask(r.Context(), cacheRow) {
+					h.TaskService.EnqueueTaskForIssue(r.Context(), cacheRow)
+				}
+			}
+
 			prefix := h.getIssuePrefix(r.Context(), cacheRow.WorkspaceID)
 			resp := issueToResponse(cacheRow, prefix)
 

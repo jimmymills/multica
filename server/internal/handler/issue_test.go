@@ -365,6 +365,88 @@ func TestCreateIssue_WriteThroughLinksAttachments(t *testing.T) {
 	}
 }
 
+// TestCreateIssue_WriteThroughEnqueuesAgentTask verifies that creating an
+// agent-assigned issue on a GitLab-connected workspace enqueues an agent task
+// — matching the legacy path's behaviour. The write-through branch must not
+// silently swallow this side-effect.
+func TestCreateIssue_WriteThroughEnqueuesAgentTask(t *testing.T) {
+	ctx := context.Background()
+
+	// Look up the seeded test agent. Its slug (lowercased name with hyphens)
+	// determines the agent::<slug> label the fake GitLab server must echo back.
+	var agentID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
+		testWorkspaceID, "Handler Test Agent",
+	).Scan(&agentID); err != nil {
+		t.Fatalf("look up test agent: %v", err)
+	}
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v4/projects/42/issues" && r.Method == http.MethodPost {
+			// Echo back the agent::handler-test-agent label so TranslateIssue
+			// resolves the agent assignee on the cache row.
+			w.Write([]byte(`{"id":9913,"iid":113,"title":"Agent-assigned","state":"opened",
+				"labels":["status::todo","priority::medium","agent::handler-test-agent"],
+				"updated_at":"2026-04-17T15:00:00Z"}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	defer testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE agent_id = $1::uuid`, agentID)
+	defer testPool.Exec(context.Background(), `DELETE FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid = 113`, testWorkspaceID)
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	body, _ := json.Marshal(map[string]any{
+		"title":         "Agent-assigned",
+		"status":        "todo",
+		"priority":      "medium",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+
+	h.CreateIssue(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	// Grab the cache row — it must be persisted with the agent assignee.
+	var issueID, gotAssigneeType, gotAssigneeID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id, assignee_type, assignee_id FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid = 113`,
+		testWorkspaceID).Scan(&issueID, &gotAssigneeType, &gotAssigneeID); err != nil {
+		t.Fatalf("query cache row: %v", err)
+	}
+	if gotAssigneeType != "agent" || gotAssigneeID != agentID {
+		t.Fatalf("cache row assignee = (%q, %q), want (agent, %q)", gotAssigneeType, gotAssigneeID, agentID)
+	}
+
+	// The write-through path must enqueue an agent task — same side effect
+	// the legacy path produces at CreateIssue's tail.
+	var taskCount int
+	if err := testPool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1::uuid AND agent_id = $2::uuid AND status = 'queued'`,
+		issueID, agentID,
+	).Scan(&taskCount); err != nil {
+		t.Fatalf("count queued tasks: %v", err)
+	}
+	if taskCount != 1 {
+		t.Fatalf("expected 1 queued task for agent-assigned write-through issue, got %d", taskCount)
+	}
+}
+
 func TestCreateIssue_LegacyPathWhenNoGitlabConnection(t *testing.T) {
 	// No workspace_gitlab_connection row → handler takes the legacy direct-DB
 	// path. (Same behaviour as pre-Phase-3a.)
