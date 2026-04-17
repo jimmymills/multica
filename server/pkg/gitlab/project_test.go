@@ -64,3 +64,26 @@ func TestGetProject_404(t *testing.T) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }
+
+func TestGetProject_FullURLIsNormalized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A pasted browser URL like https://gitlab.com/group/app should resolve
+		// the same as the bare path "group/app" — host gets stripped, slashes
+		// get URL-encoded.
+		if r.RequestURI != "/api/v4/projects/group%2Fapp" {
+			t.Errorf("request URI = %q, want /api/v4/projects/group%%2Fapp", r.RequestURI)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id": 11, "path_with_namespace": "group/app"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, srv.Client())
+	p, err := c.GetProject(context.Background(), "tok", "https://gitlab.com/group/app")
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if p.ID != 11 {
+		t.Fatalf("id = %d, want 11", p.ID)
+	}
+}
