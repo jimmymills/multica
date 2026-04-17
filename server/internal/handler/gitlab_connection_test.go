@@ -146,6 +146,50 @@ func TestGetGitlabWorkspaceConnection_NotConnected(t *testing.T) {
 	}
 }
 
+func TestDisconnectGitlabWorkspace_Success(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v4/user":
+			w.Write([]byte(`{"id": 1, "username": "svc"}`))
+		case "/api/v4/projects/1":
+			w.Write([]byte(`{"id": 1, "path_with_namespace": "g/a"}`))
+		}
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+
+	// Create one to delete.
+	body, _ := json.Marshal(map[string]string{"project": "1", "token": "glpat-x"})
+	postReq := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	postReq.Header.Set("X-User-ID", testUserID)
+	postReq = withURLParam(postReq, "workspaceID", testWorkspaceID)
+	h.ConnectGitlabWorkspace(httptest.NewRecorder(), postReq)
+
+	// DELETE.
+	delReq := httptest.NewRequest(http.MethodDelete, "/", nil)
+	delReq.Header.Set("X-User-ID", testUserID)
+	delReq = withURLParam(delReq, "workspaceID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+	h.DisconnectGitlabWorkspace(rr, delReq)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+
+	// GET should now 404.
+	getReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	getReq.Header.Set("X-User-ID", testUserID)
+	getReq = withURLParam(getReq, "workspaceID", testWorkspaceID)
+	rr2 := httptest.NewRecorder()
+	h.GetGitlabWorkspaceConnection(rr2, getReq)
+	if rr2.Code != http.StatusNotFound {
+		t.Fatalf("after delete, GET should 404, got %d", rr2.Code)
+	}
+}
+
 func TestConnectGitlabWorkspace_BadToken(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

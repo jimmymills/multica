@@ -115,6 +115,25 @@ func (h *Handler) ConnectGitlabWorkspace(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// DisconnectGitlabWorkspace removes the workspace's GitLab connection.
+// Note: Phase 2 will extend this to also delete the webhook in GitLab.
+func (h *Handler) DisconnectGitlabWorkspace(w http.ResponseWriter, r *http.Request) {
+	if !h.GitlabEnabled {
+		writeError(w, http.StatusNotFound, "gitlab integration disabled")
+		return
+	}
+	workspaceID := chi.URLParam(r, "workspaceID")
+	if _, ok := h.requireWorkspaceRole(w, r, workspaceID, "workspace not found", "owner", "admin"); !ok {
+		return
+	}
+	if err := h.Queries.DeleteWorkspaceGitlabConnection(r.Context(), parseUUID(workspaceID)); err != nil {
+		slog.Error("delete workspace_gitlab_connection failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to disconnect")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // GetGitlabWorkspaceConnection returns sanitized connection status (never the token).
 func (h *Handler) GetGitlabWorkspaceConnection(w http.ResponseWriter, r *http.Request) {
 	if !h.GitlabEnabled {
