@@ -369,18 +369,21 @@ DELETE FROM issue WHERE workspace_id = $1 AND gitlab_iid IS NOT NULL;
 -- comment cache upserts ----------------------------------------------------
 
 -- name: UpsertCommentFromGitlab :one
+-- NOTE: comment.body in the original spec is actually comment.content.
+-- workspace_id is NOT NULL on comment, so it must be supplied.
 INSERT INTO comment (
+    workspace_id,
     issue_id,
     author_type,
     author_id,
-    body,
+    content,
     type,
     gitlab_note_id,
     external_updated_at
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (gitlab_note_id) WHERE gitlab_note_id IS NOT NULL DO UPDATE SET
-    body = EXCLUDED.body,
+    content = EXCLUDED.content,
     type = EXCLUDED.type,
     external_updated_at = EXCLUDED.external_updated_at,
     updated_at = now()
@@ -389,15 +392,18 @@ RETURNING *;
 -- issue_reaction cache upserts --------------------------------------------
 
 -- name: UpsertIssueReactionFromGitlab :one
+-- NOTE: issue_reaction columns in the original spec are user_id/user_type,
+-- but the actual schema uses actor_id/actor_type. workspace_id is NOT NULL.
 INSERT INTO issue_reaction (
+    workspace_id,
     issue_id,
-    user_id,
-    user_type,
+    actor_id,
+    actor_type,
     emoji,
     gitlab_award_id,
     external_updated_at
 )
-VALUES ($1, $2, $3, $4, $5, $6)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (gitlab_award_id) WHERE gitlab_award_id IS NOT NULL DO UPDATE SET
     emoji = EXCLUDED.emoji,
     external_updated_at = EXCLUDED.external_updated_at
@@ -2304,10 +2310,11 @@ func syncOneIssue(
 			}
 		}
 		if _, err := deps.Queries.UpsertCommentFromGitlab(ctx, db.UpsertCommentFromGitlabParams{
+			WorkspaceID:       wsUUID,
 			IssueID:           row.ID,
 			AuthorType:        authorType,
 			AuthorID:          authorID,
-			Body:              nv.Body,
+			Content:           nv.Body, // comment.body in plan was actually comment.content
 			Type:              nv.Type,
 			GitlabNoteID:      pgtype.Int8{Int64: n.ID, Valid: true},
 			ExternalUpdatedAt: parseTS(nv.UpdatedAt),
@@ -2323,11 +2330,12 @@ func syncOneIssue(
 	}
 	for _, a := range awards {
 		av := TranslateAward(a)
-		// Phase 2a: leave user_id NULL for native gitlab users (Phase 3 maps).
+		// Phase 2a: leave actor_id NULL for native gitlab users (Phase 3 maps).
 		if _, err := deps.Queries.UpsertIssueReactionFromGitlab(ctx, db.UpsertIssueReactionFromGitlabParams{
+			WorkspaceID:       wsUUID,
 			IssueID:           row.ID,
-			UserID:            pgtype.UUID{},
-			UserType:          pgtype.Text{},
+			ActorID:           pgtype.UUID{}, // issue_reaction columns are actor_id/actor_type, not user_id/user_type
+			ActorType:         pgtype.Text{},
 			Emoji:             av.Emoji,
 			GitlabAwardID:     pgtype.Int8{Int64: a.ID, Valid: true},
 			ExternalUpdatedAt: parseTS(av.UpdatedAt),
