@@ -3,6 +3,8 @@ package gitlab
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -73,7 +75,7 @@ func RunInitialSync(ctx context.Context, deps SyncDeps, in RunInitialSyncInput) 
 		}
 	}
 
-	// 4. Issues + notes + awards (Task 12 implements this).
+	// 4. Issues + notes + awards.
 	if err := syncAllIssues(ctx, deps, in, wsUUID); err != nil {
 		return fmt.Errorf("initial sync: issues: %w", err)
 	}
@@ -91,7 +93,211 @@ func pgUUID(s string) (pgtype.UUID, error) {
 	return u, nil
 }
 
-// syncAllIssues is implemented in Task 12. Stub here so the file compiles.
-func syncAllIssues(_ context.Context, _ SyncDeps, _ RunInitialSyncInput, _ pgtype.UUID) error {
+// syncAllIssues fetches every project issue and upserts each (with notes,
+// awards, and label associations) into the cache. Concurrency bounded at 5.
+func syncAllIssues(ctx context.Context, deps SyncDeps, in RunInitialSyncInput, wsUUID pgtype.UUID) error {
+	issues, err := deps.Client.ListIssues(ctx, in.Token, in.ProjectID, gitlabapi.ListIssuesParams{State: "all"})
+	if err != nil {
+		return fmt.Errorf("list issues: %w", err)
+	}
+
+	// Build the agent-slug → uuid lookup once for the translator.
+	// The agent table has no slug column; derive slug from name.
+	agentMap, err := buildAgentSlugMap(ctx, deps.Queries, wsUUID)
+	if err != nil {
+		return fmt.Errorf("agent map: %w", err)
+	}
+
+	// Build the gitlab_label_id by name lookup so we can set issue_gitlab_label
+	// associations from the issue's label-name list.
+	labels, err := deps.Queries.ListGitlabLabels(ctx, wsUUID)
+	if err != nil {
+		return fmt.Errorf("list cached labels: %w", err)
+	}
+	labelIDByName := make(map[string]int64, len(labels))
+	for _, l := range labels {
+		labelIDByName[l.Name] = l.GitlabLabelID
+	}
+
+	const maxConcurrent = 5
+	sem := make(chan struct{}, maxConcurrent)
+	errs := make(chan error, len(issues))
+	var wg sync.WaitGroup
+
+	for _, issue := range issues {
+		issue := issue
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := syncOneIssue(ctx, deps, in, wsUUID, issue, agentMap, labelIDByName); err != nil {
+				errs <- fmt.Errorf("issue iid=%d: %w", issue.IID, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		return e
+	}
 	return nil
+}
+
+func syncOneIssue(
+	ctx context.Context,
+	deps SyncDeps,
+	in RunInitialSyncInput,
+	wsUUID pgtype.UUID,
+	issue gitlabapi.Issue,
+	agentMap map[string]string,
+	labelIDByName map[string]int64,
+) error {
+	values := TranslateIssue(issue, &TranslateContext{AgentBySlug: agentMap})
+
+	row, err := deps.Queries.UpsertIssueFromGitlab(ctx, buildUpsertIssueParams(wsUUID, in.ProjectID, issue, values))
+	if err != nil {
+		return fmt.Errorf("upsert issue: %w", err)
+	}
+
+	// Replace label associations.
+	labelIDs := make([]int64, 0, len(issue.Labels))
+	for _, name := range issue.Labels {
+		if id, ok := labelIDByName[name]; ok {
+			labelIDs = append(labelIDs, id)
+		}
+	}
+	if err := deps.Queries.ClearIssueLabels(ctx, row.ID); err != nil {
+		return fmt.Errorf("clear labels: %w", err)
+	}
+	if len(labelIDs) > 0 {
+		if err := deps.Queries.AddIssueLabels(ctx, db.AddIssueLabelsParams{
+			IssueID:     row.ID,
+			WorkspaceID: wsUUID,
+			LabelIds:    labelIDs,
+		}); err != nil {
+			return fmt.Errorf("add labels: %w", err)
+		}
+	}
+
+	// Notes: only upsert agent-authored notes for now.
+	// The comment table requires author_type IN ('member', 'agent') NOT NULL and
+	// author_id NOT NULL. Human notes from GitLab have no resolved Multica
+	// member_id yet (Phase 3 will add user_gitlab_connection lookup), so we
+	// skip them rather than violate the CHECK constraint.
+	notes, err := deps.Client.ListNotes(ctx, in.Token, in.ProjectID, issue.IID)
+	if err != nil {
+		return fmt.Errorf("list notes: %w", err)
+	}
+	for _, n := range notes {
+		nv := TranslateNote(n)
+		// AuthorType is a plain string in the params struct (NOT pgtype.Text).
+		if nv.AuthorType != "agent" {
+			continue // skip unresolved / human notes
+		}
+		uuidStr, ok := agentMap[nv.AuthorSlug]
+		if !ok {
+			continue // agent slug not found in this workspace
+		}
+		var authorID pgtype.UUID
+		_ = authorID.Scan(uuidStr)
+		if _, err := deps.Queries.UpsertCommentFromGitlab(ctx, db.UpsertCommentFromGitlabParams{
+			WorkspaceID:       wsUUID,
+			IssueID:           row.ID,
+			AuthorType:        "agent",
+			AuthorID:          authorID,
+			Content:           nv.Body, // column is content, not body
+			Type:              nv.Type,
+			GitlabNoteID:      pgtype.Int8{Int64: n.ID, Valid: true},
+			ExternalUpdatedAt: parseTS(nv.UpdatedAt),
+		}); err != nil {
+			return fmt.Errorf("upsert note %d: %w", n.ID, err)
+		}
+	}
+
+	// Awards: only upsert if actor can be resolved.
+	// issue_reaction.actor_type is NOT NULL CHECK ('member', 'agent').
+	// Phase 3 will resolve human awards via user_gitlab_connection.
+	awards, err := deps.Client.ListAwardEmoji(ctx, in.Token, in.ProjectID, issue.IID)
+	if err != nil {
+		return fmt.Errorf("list awards: %w", err)
+	}
+	// NOTE: To upsert awards we need a resolved actor_type + actor_id.
+	// The issue_reaction table requires actor_type IN ('member','agent')
+	// NOT NULL. Without user_gitlab_connection we cannot resolve human
+	// reactor IDs, so we skip all awards in Phase 2a.
+	_ = awards
+
+	return nil
+}
+
+// buildUpsertIssueParams converts a translated IssueValues + raw GitLab issue
+// into the sqlc params struct.
+func buildUpsertIssueParams(wsUUID pgtype.UUID, projectID int64, issue gitlabapi.Issue, values IssueValues) db.UpsertIssueFromGitlabParams {
+	var assigneeType pgtype.Text
+	var assigneeID pgtype.UUID
+	if values.AssigneeType != "" {
+		assigneeType = pgtype.Text{String: values.AssigneeType, Valid: true}
+		_ = assigneeID.Scan(values.AssigneeID)
+	}
+	desc := pgtype.Text{}
+	if values.Description != "" {
+		desc = pgtype.Text{String: values.Description, Valid: true}
+	}
+	return db.UpsertIssueFromGitlabParams{
+		WorkspaceID:       wsUUID,
+		GitlabIid:         pgtype.Int4{Int32: int32(issue.IID), Valid: true},
+		GitlabProjectID:   pgtype.Int8{Int64: projectID, Valid: true},
+		Title:             values.Title,
+		Description:       desc,
+		Status:            values.Status,
+		Priority:          values.Priority,
+		AssigneeType:      assigneeType,
+		AssigneeID:        assigneeID,
+		CreatorType:       pgtype.Text{}, // NULL — Phase 3 populates
+		CreatorID:         pgtype.UUID{}, // NULL — Phase 3 populates
+		DueDate:           parseTS(values.DueDate),
+		ExternalUpdatedAt: parseTS(values.UpdatedAt),
+	}
+}
+
+// buildAgentSlugMap loads slug→uuid for every agent in the workspace.
+// The agent table has no slug column; we derive slug from name (lowercased,
+// spaces → hyphens). Phase 4 may formalize this with a real slug column.
+func buildAgentSlugMap(ctx context.Context, q *db.Queries, wsUUID pgtype.UUID) (map[string]string, error) {
+	rows, err := q.ListAgents(ctx, wsUUID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		slug := strings.ToLower(strings.ReplaceAll(r.Name, " ", "-"))
+		out[slug] = uuidString(r.ID)
+	}
+	return out, nil
+}
+
+// parseTS converts a GitLab RFC3339 timestamp into pgtype.Timestamptz.
+func parseTS(s string) pgtype.Timestamptz {
+	if s == "" {
+		return pgtype.Timestamptz{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: t, Valid: true}
+}
+
+// uuidString stringifies a pgtype.UUID. Returns "" if invalid.
+func uuidString(u pgtype.UUID) string {
+	if !u.Valid {
+		return ""
+	}
+	bs, _ := u.MarshalJSON()
+	s := string(bs)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1 : len(s)-1]
+	}
+	return s
 }

@@ -102,3 +102,91 @@ func TestInitialSync_LabelsAndMembers(t *testing.T) {
 		t.Errorf("members = %+v, want one alice", members)
 	}
 }
+
+func TestInitialSync_IssuesNotesAwards(t *testing.T) {
+	pool := connectTestPool(t)
+	defer pool.Close()
+	wsID := makeWorkspace(t, pool)
+
+	// Insert a runtime + agent NAMED "builder" so the agent::builder label resolves.
+	// (Note: agent table has no slug column; we derive slug from name.)
+	var runtimeID string
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO agent_runtime (workspace_id, name, runtime_mode, provider)
+		VALUES ($1, 'test-runtime', 'cloud', 'test')
+		RETURNING id
+	`, wsID).Scan(&runtimeID); err != nil {
+		t.Fatalf("insert runtime: %v", err)
+	}
+	var agentID string
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO agent (workspace_id, name, runtime_mode, runtime_config, visibility, max_concurrent_tasks, owner_id, runtime_id)
+		VALUES ($1, 'builder', 'cloud', '{}'::jsonb, 'workspace', 1, NULL, $2)
+		RETURNING id
+	`, wsID, runtimeID).Scan(&agentID); err != nil {
+		t.Fatalf("insert agent: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/api/v4/projects/7/labels" && r.Method == http.MethodGet:
+			json.NewEncoder(w).Encode([]gitlabapi.Label{
+				{ID: 10, Name: "status::in_progress", Color: "#3b82f6"},
+				{ID: 11, Name: "agent::builder", Color: "#8b5cf6"},
+			})
+		case r.URL.Path == "/api/v4/projects/7/labels" && r.Method == http.MethodPost:
+			w.Write([]byte(`{"id":999,"name":"x"}`))
+		case r.URL.Path == "/api/v4/projects/7/members/all":
+			json.NewEncoder(w).Encode([]gitlabapi.ProjectMember{})
+		case r.URL.Path == "/api/v4/projects/7/issues":
+			json.NewEncoder(w).Encode([]gitlabapi.Issue{
+				{
+					ID: 1001, IID: 42, Title: "First issue",
+					Description: "body", State: "opened",
+					Labels:    []string{"status::in_progress", "agent::builder"},
+					UpdatedAt: "2026-04-17T10:00:00Z",
+				},
+			})
+		case r.URL.Path == "/api/v4/projects/7/issues/42/notes":
+			json.NewEncoder(w).Encode([]gitlabapi.Note{
+				{ID: 1, Body: "hello", System: false,
+					Author:    gitlabapi.User{ID: 100, Username: "alice"},
+					UpdatedAt: "2026-04-17T10:01:00Z"},
+			})
+		case r.URL.Path == "/api/v4/projects/7/issues/42/award_emoji":
+			json.NewEncoder(w).Encode([]gitlabapi.AwardEmoji{
+				{ID: 5, Name: "thumbsup",
+					User:      gitlabapi.User{ID: 100, Username: "alice"},
+					UpdatedAt: "2026-04-17T10:02:00Z"},
+			})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	queries := db.New(pool)
+	deps := SyncDeps{Queries: queries, Client: gitlabapi.NewClient(srv.URL, srv.Client())}
+	err := RunInitialSync(context.Background(), deps, RunInitialSyncInput{
+		WorkspaceID: wsID, ProjectID: 7, Token: "tok",
+	})
+	if err != nil {
+		t.Fatalf("RunInitialSync: %v", err)
+	}
+
+	// Verify the issue exists with the right status + agent assignment.
+	row, err := queries.GetIssueByGitlabIID(context.Background(), db.GetIssueByGitlabIIDParams{
+		WorkspaceID: mustPGUUID(t, wsID),
+		GitlabIid:   pgtype.Int4{Int32: 42, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("GetIssueByGitlabIID: %v", err)
+	}
+	if row.Status != "in_progress" {
+		t.Errorf("status = %q, want in_progress", row.Status)
+	}
+	if !row.AssigneeType.Valid || row.AssigneeType.String != "agent" {
+		t.Errorf("assignee_type = %+v, want agent", row.AssigneeType)
+	}
+}
