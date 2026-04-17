@@ -8,6 +8,44 @@ import (
 	"testing"
 )
 
+func TestCreateIssue_PostsCorrectBody(t *testing.T) {
+	var got CreateIssueInput
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v4/projects/7/issues" {
+			t.Errorf("path = %s, want /api/v4/projects/7/issues", r.URL.Path)
+		}
+		json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(Issue{
+			ID: 9001, IID: 11, Title: got.Title, State: "opened",
+			Labels: got.Labels, UpdatedAt: "2026-04-17T15:00:00Z",
+		})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, srv.Client())
+	out, err := c.CreateIssue(context.Background(), "tok", 7, CreateIssueInput{
+		Title:       "hi",
+		Description: "body",
+		Labels:      []string{"status::todo", "priority::high"},
+	})
+	if err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if got.Title != "hi" || got.Description != "body" {
+		t.Errorf("server received %+v", got)
+	}
+	if len(got.Labels) != 2 {
+		t.Errorf("labels = %v", got.Labels)
+	}
+	if out.IID != 11 {
+		t.Errorf("returned IID = %d, want 11", out.IID)
+	}
+}
+
 func TestListIssues_DefaultsToStateAll(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != "all" {
