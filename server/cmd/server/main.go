@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/multica-ai/multica/server/internal/events"
+	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	"github.com/multica-ai/multica/server/internal/logger"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -37,6 +38,11 @@ func main() {
 	// so operators don't get caught out by writing TRUE/yes/1 in their env file.
 	gitlabEnabled, _ := strconv.ParseBool(os.Getenv("MULTICA_GITLAB_ENABLED"))
 	gitlabClient := gitlab.NewClient(gitlab.DefaultBaseURL, &http.Client{Timeout: 30 * time.Second})
+
+	publicURL := os.Getenv("MULTICA_PUBLIC_URL")
+	if publicURL == "" && gitlabEnabled {
+		slog.Warn("MULTICA_PUBLIC_URL is not set; gitlab webhook registration will be skipped (cache will go stale after sync)")
+	}
 
 	secretsCipher, sErr := secrets.Load()
 	if sErr != nil {
@@ -96,7 +102,7 @@ func main() {
 
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
-	r := NewRouter(pool, hub, bus, secretsCipher, gitlabClient, gitlabEnabled, serverCtx)
+	r := NewRouter(pool, hub, bus, secretsCipher, gitlabClient, gitlabEnabled, serverCtx, publicURL)
 
 	srv := &http.Server{
 		Addr:    ":" + port,
@@ -113,6 +119,24 @@ func main() {
 	// Start background sweeper to mark stale runtimes as offline.
 	go runRuntimeSweeper(sweepCtx, queries, bus)
 	go runAutopilotScheduler(autopilotCtx, queries, autopilotSvc)
+
+	if gitlabEnabled {
+		glQueries := db.New(pool)
+		// Webhook worker pool — drains gitlab_webhook_event into the cache.
+		webhookWorker := gitlabsync.NewWebhookWorker(glQueries, pool, 5, 250*time.Millisecond)
+		go webhookWorker.Run(serverCtx)
+
+		// Reconciler — 5-minute drift catcher.
+		decrypter := gitlabsync.TokenDecrypter(func(ctx context.Context, encrypted []byte) (string, error) {
+			plain, err := secretsCipher.Decrypt(encrypted)
+			if err != nil {
+				return "", err
+			}
+			return string(plain), nil
+		})
+		reconciler := gitlabsync.NewReconciler(glQueries, gitlabClient, decrypter)
+		go reconciler.Run(serverCtx)
+	}
 
 	// Graceful shutdown
 	go func() {
