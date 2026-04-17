@@ -229,12 +229,15 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 			r.Get("/api/assignee-frequency", h.GetAssigneeFrequency)
 
 			// Issues
+			// POST /api/issues uses GitLab write-through (Phase 3a) — no 501 stopgap.
+			r.Post("/api/issues", h.CreateIssue)
+			// All other issue write endpoints still return 501 when a GitLab workspace
+			// is connected (Phase 3b will migrate them one by one).
 			r.Route("/api/issues", func(r chi.Router) {
 				r.Use(middleware.GitlabWritesBlocked(queries))
 				r.Get("/search", h.SearchIssues)
 				r.Get("/child-progress", h.ChildIssueProgress)
 				r.Get("/", h.ListIssues)
-				r.Post("/", h.CreateIssue)
 				r.Post("/batch-update", h.BatchUpdateIssues)
 				r.Post("/batch-delete", h.BatchDeleteIssues)
 				r.Route("/{id}", func(r chi.Router) {
