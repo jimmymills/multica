@@ -456,7 +456,11 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
-	isAuthor := existing.AuthorType.String == actorType && uuidToString(existing.AuthorID) == actorID
+	// Synced rows from GitLab may have NULL author_type/author_id (Phase 3 will
+	// backfill once user_gitlab_connection lookup is wired). Treat NULL as
+	// "not the author" rather than coincidentally matching empty strings.
+	isAuthor := existing.AuthorType.Valid && existing.AuthorType.String == actorType &&
+		existing.AuthorID.Valid && uuidToString(existing.AuthorID) == actorID
 	isAdmin := roleAllowed(member.Role, "owner", "admin")
 	if !isAuthor && !isAdmin {
 		writeError(w, http.StatusForbidden, "only comment author or admin can edit")
@@ -523,7 +527,11 @@ func (h *Handler) DeleteComment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
-	isAuthor := comment.AuthorType.String == actorType && uuidToString(comment.AuthorID) == actorID
+	// Synced rows from GitLab may have NULL author_type/author_id (Phase 3 will
+	// backfill once user_gitlab_connection lookup is wired). Treat NULL as
+	// "not the author" rather than coincidentally matching empty strings.
+	isAuthor := comment.AuthorType.Valid && comment.AuthorType.String == actorType &&
+		comment.AuthorID.Valid && uuidToString(comment.AuthorID) == actorID
 	isAdmin := roleAllowed(member.Role, "owner", "admin")
 	if !isAuthor && !isAdmin {
 		writeError(w, http.StatusForbidden, "only comment author or admin can delete")

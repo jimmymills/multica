@@ -3,6 +3,7 @@ package gitlab
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -319,6 +320,13 @@ func buildAgentSlugMap(ctx context.Context, q *db.Queries, wsUUID pgtype.UUID) (
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {
 		slug := strings.ToLower(strings.ReplaceAll(r.Name, " ", "-"))
+		if existing, dup := out[slug]; dup {
+			slog.Warn("agent slug collision in workspace; later agent wins",
+				"workspace_id", uuidString(wsUUID),
+				"slug", slug,
+				"existing_agent_id", existing,
+				"new_agent_id", uuidString(r.ID))
+		}
 		out[slug] = uuidString(r.ID)
 	}
 	return out, nil
