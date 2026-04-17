@@ -231,36 +231,44 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 			// Assignee frequency
 			r.Get("/api/assignee-frequency", h.GetAssigneeFrequency)
 
-			// Issues
-			// POST /api/issues uses GitLab write-through (Phase 3a) — no 501 stopgap.
-			r.Post("/api/issues", h.CreateIssue)
-			// All other issue write endpoints still return 501 when a GitLab workspace
-			// is connected (Phase 3b will migrate them one by one).
+			// Issues — POST uses GitLab write-through (Phase 3a). All other writes
+			// still 501 while connected; Phase 3b migrates them one by one.
 			r.Route("/api/issues", func(r chi.Router) {
-				r.Use(middleware.GitlabWritesBlocked(queries))
+				gw := middleware.GitlabWritesBlocked(queries)
+
+				// Reads — always allowed.
 				r.Get("/search", h.SearchIssues)
 				r.Get("/child-progress", h.ChildIssueProgress)
 				r.Get("/", h.ListIssues)
-				r.Post("/batch-update", h.BatchUpdateIssues)
-				r.Post("/batch-delete", h.BatchDeleteIssues)
+
+				// POST root is the only write migrated to write-through (Phase 3a).
+				r.Post("/", h.CreateIssue)
+
+				// Other root writes — gated until Phase 3b migrates them.
+				r.With(gw).Post("/batch-update", h.BatchUpdateIssues)
+				r.With(gw).Post("/batch-delete", h.BatchDeleteIssues)
+
 				r.Route("/{id}", func(r chi.Router) {
+					// Reads — always allowed.
 					r.Get("/", h.GetIssue)
-					r.Put("/", h.UpdateIssue)
-					r.Delete("/", h.DeleteIssue)
-					r.Post("/comments", h.CreateComment)
 					r.Get("/comments", h.ListComments)
 					r.Get("/timeline", h.ListTimeline)
 					r.Get("/subscribers", h.ListIssueSubscribers)
-					r.Post("/subscribe", h.SubscribeToIssue)
-					r.Post("/unsubscribe", h.UnsubscribeFromIssue)
 					r.Get("/active-task", h.GetActiveTaskForIssue)
-					r.Post("/tasks/{taskId}/cancel", h.CancelTask)
 					r.Get("/task-runs", h.ListTasksByIssue)
 					r.Get("/usage", h.GetIssueUsage)
-					r.Post("/reactions", h.AddIssueReaction)
-					r.Delete("/reactions", h.RemoveIssueReaction)
 					r.Get("/attachments", h.ListAttachments)
 					r.Get("/children", h.ListChildIssues)
+
+					// Writes — gated until Phase 3b migrates them.
+					r.With(gw).Put("/", h.UpdateIssue)
+					r.With(gw).Delete("/", h.DeleteIssue)
+					r.With(gw).Post("/comments", h.CreateComment)
+					r.With(gw).Post("/subscribe", h.SubscribeToIssue)
+					r.With(gw).Post("/unsubscribe", h.UnsubscribeFromIssue)
+					r.With(gw).Post("/tasks/{taskId}/cancel", h.CancelTask)
+					r.With(gw).Post("/reactions", h.AddIssueReaction)
+					r.With(gw).Delete("/reactions", h.RemoveIssueReaction)
 				})
 			})
 
