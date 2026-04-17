@@ -219,6 +219,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 
 			// Issues
 			r.Route("/api/issues", func(r chi.Router) {
+				r.Use(middleware.GitlabWritesBlocked(queries))
 				r.Get("/search", h.SearchIssues)
 				r.Get("/child-progress", h.ChildIssueProgress)
 				r.Get("/", h.ListIssues)

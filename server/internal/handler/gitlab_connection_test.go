@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -423,6 +425,37 @@ func TestDisconnectGitlabWorkspace_TruncatesCache(t *testing.T) {
 	labels, _ := h.Queries.ListGitlabLabels(context.Background(), parseUUID(testWorkspaceID))
 	if len(labels) != 0 {
 		t.Errorf("expected cache truncated, found %d labels", len(labels))
+	}
+}
+
+func TestGitlabConnectedWorkspace_WriteReturns501(t *testing.T) {
+	h := buildHandlerWithGitlab(t, "http://unused")
+	h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	h.Queries.CreateWorkspaceGitlabConnection(context.Background(), db.CreateWorkspaceGitlabConnectionParams{
+		WorkspaceID:           parseUUID(testWorkspaceID),
+		GitlabProjectID:       42,
+		GitlabProjectPath:     "team/app",
+		ServiceTokenEncrypted: []byte("x"),
+		ServiceTokenUserID:    1,
+		ConnectionStatus:      "connected",
+	})
+	defer h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+
+	// Build a tiny router that mounts CreateIssue under the middleware.
+	r := chi.NewRouter()
+	r.Route("/api/workspaces/{id}/issues", func(r chi.Router) {
+		r.Use(middleware.GitlabWritesBlocked(h.Queries))
+		r.Post("/", h.CreateIssue)
+	})
+
+	body, _ := json.Marshal(map[string]any{"title": "Test", "status": "todo", "priority": "medium"})
+	req := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/api/workspaces/%s/issues/", testWorkspaceID), bytes.NewReader(body))
+	req.Header.Set("X-User-ID", testUserID)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501; body = %s", rr.Code, rr.Body.String())
 	}
 }
 
