@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
+	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -63,6 +64,10 @@ type Handler struct {
 	// PublicURL is the externally-reachable base URL of this Multica server,
 	// used to build the gitlab webhook URL. Empty disables webhook registration.
 	PublicURL string
+
+	// GitlabResolver picks the right token (user PAT vs service PAT) for
+	// write requests. Non-nil only when GitlabEnabled is true.
+	GitlabResolver *gitlabsync.Resolver
 }
 
 func New(
@@ -113,6 +118,12 @@ func (h *Handler) SetBaseCtx(ctx context.Context) {
 // server boot.
 func (h *Handler) SetPublicURL(url string) {
 	h.PublicURL = url
+}
+
+// SetGitlabResolver wires the per-request token resolver. Called once from
+// main.go after server boot.
+func (h *Handler) SetGitlabResolver(r *gitlabsync.Resolver) {
+	h.GitlabResolver = r
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

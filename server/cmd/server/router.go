@@ -14,6 +14,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
+	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -59,7 +60,7 @@ func allowedOrigins() []string {
 // workers (e.g. the gitlab initial-sync goroutine) inherit it so they stop cleanly.
 // publicURL is the externally-reachable base URL used to register gitlab webhooks;
 // empty string disables webhook registration.
-func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCipher *secrets.Cipher, gitlabClient *gitlab.Client, gitlabEnabled bool, serverCtx context.Context, publicURL string) chi.Router {
+func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCipher *secrets.Cipher, gitlabClient *gitlab.Client, gitlabEnabled bool, serverCtx context.Context, publicURL string, gitlabResolver *gitlabsync.Resolver) chi.Router {
 	queries := db.New(pool)
 	emailSvc := service.NewEmailService()
 
@@ -79,6 +80,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, secretsCipher, gitlabClient, gitlabEnabled)
 	h.SetBaseCtx(serverCtx)
 	h.SetPublicURL(publicURL)
+	h.SetGitlabResolver(gitlabResolver)
 
 	r := chi.NewRouter()
 
