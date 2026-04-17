@@ -138,10 +138,10 @@ db-down:
 	@$(COMPOSE) down
 
 generate-secrets-key:
-	@if ! grep -q '^MULTICA_SECRETS_KEY=' .env 2>/dev/null; then \
+	@if ! grep -qE '^MULTICA_SECRETS_KEY=.+' "$(ENV_FILE)" 2>/dev/null; then \
 		key=$$(head -c 32 /dev/urandom | base64) ; \
-		echo "MULTICA_SECRETS_KEY=$$key" >> .env ; \
-		echo "generated MULTICA_SECRETS_KEY in .env" ; \
+		echo "MULTICA_SECRETS_KEY=$$key" >> "$(ENV_FILE)" ; \
+		echo "generated MULTICA_SECRETS_KEY in $(ENV_FILE)" ; \
 	fi
 
 worktree-env:
