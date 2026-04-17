@@ -14,6 +14,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
+	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
@@ -59,6 +60,12 @@ func allowedOrigins() []string {
 // workers (e.g. the gitlab initial-sync goroutine) inherit it so they stop cleanly.
 // publicURL is the externally-reachable base URL used to register gitlab webhooks;
 // empty string disables webhook registration.
+//
+// The GitLab write-path resolver is constructed inside this function when
+// gitlabEnabled is true, so every route registered below sees a non-nil
+// resolver on the handler. Previously the resolver was passed in from main.go
+// and could be nil at the time SetGitlabResolver ran; the write-through guard
+// then silently fell back to the legacy direct-DB path in production.
 func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCipher *secrets.Cipher, gitlabClient *gitlab.Client, gitlabEnabled bool, serverCtx context.Context, publicURL string) chi.Router {
 	queries := db.New(pool)
 	emailSvc := service.NewEmailService()
@@ -79,6 +86,10 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, secretsCipher, gitlabClient, gitlabEnabled)
 	h.SetBaseCtx(serverCtx)
 	h.SetPublicURL(publicURL)
+	if gitlabEnabled {
+		decrypter := gitlabsync.NewCipherDecrypter(secretsCipher)
+		h.SetGitlabResolver(gitlabsync.NewResolver(queries, decrypter))
+	}
 
 	r := chi.NewRouter()
 
@@ -172,6 +183,9 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 		r.Get("/api/config", h.GetConfig)
 		r.Get("/api/me", h.GetMe)
 		r.Patch("/api/me", h.UpdateMe)
+		r.Post("/api/me/gitlab/connect", h.ConnectUserGitlab)
+		r.Get("/api/me/gitlab/connect", h.GetUserGitlabConnection)
+		r.Delete("/api/me/gitlab/connect", h.DisconnectUserGitlab)
 		r.Post("/api/cli-token", h.IssueCliToken)
 		r.Post("/api/upload-file", h.UploadFile)
 
@@ -226,33 +240,44 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 			// Assignee frequency
 			r.Get("/api/assignee-frequency", h.GetAssigneeFrequency)
 
-			// Issues
+			// Issues — POST uses GitLab write-through (Phase 3a). All other writes
+			// still 501 while connected; Phase 3b migrates them one by one.
 			r.Route("/api/issues", func(r chi.Router) {
-				r.Use(middleware.GitlabWritesBlocked(queries))
+				gw := middleware.GitlabWritesBlocked(queries)
+
+				// Reads — always allowed.
 				r.Get("/search", h.SearchIssues)
 				r.Get("/child-progress", h.ChildIssueProgress)
 				r.Get("/", h.ListIssues)
+
+				// POST root is the only write migrated to write-through (Phase 3a).
 				r.Post("/", h.CreateIssue)
-				r.Post("/batch-update", h.BatchUpdateIssues)
-				r.Post("/batch-delete", h.BatchDeleteIssues)
+
+				// Other root writes — gated until Phase 3b migrates them.
+				r.With(gw).Post("/batch-update", h.BatchUpdateIssues)
+				r.With(gw).Post("/batch-delete", h.BatchDeleteIssues)
+
 				r.Route("/{id}", func(r chi.Router) {
+					// Reads — always allowed.
 					r.Get("/", h.GetIssue)
-					r.Put("/", h.UpdateIssue)
-					r.Delete("/", h.DeleteIssue)
-					r.Post("/comments", h.CreateComment)
 					r.Get("/comments", h.ListComments)
 					r.Get("/timeline", h.ListTimeline)
 					r.Get("/subscribers", h.ListIssueSubscribers)
-					r.Post("/subscribe", h.SubscribeToIssue)
-					r.Post("/unsubscribe", h.UnsubscribeFromIssue)
 					r.Get("/active-task", h.GetActiveTaskForIssue)
-					r.Post("/tasks/{taskId}/cancel", h.CancelTask)
 					r.Get("/task-runs", h.ListTasksByIssue)
 					r.Get("/usage", h.GetIssueUsage)
-					r.Post("/reactions", h.AddIssueReaction)
-					r.Delete("/reactions", h.RemoveIssueReaction)
 					r.Get("/attachments", h.ListAttachments)
 					r.Get("/children", h.ListChildIssues)
+
+					// Writes — gated until Phase 3b migrates them.
+					r.With(gw).Put("/", h.UpdateIssue)
+					r.With(gw).Delete("/", h.DeleteIssue)
+					r.With(gw).Post("/comments", h.CreateComment)
+					r.With(gw).Post("/subscribe", h.SubscribeToIssue)
+					r.With(gw).Post("/unsubscribe", h.UnsubscribeFromIssue)
+					r.With(gw).Post("/tasks/{taskId}/cancel", h.CancelTask)
+					r.With(gw).Post("/reactions", h.AddIssueReaction)
+					r.With(gw).Delete("/reactions", h.RemoveIssueReaction)
 				})
 			})
 

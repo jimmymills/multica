@@ -134,3 +134,85 @@ func TestTranslateAward_PassesEmoji(t *testing.T) {
 		t.Errorf("GitlabUserID = %d, want 100", out.GitlabUserID)
 	}
 }
+
+func TestBuildCreateIssueInput_StatusAndPriorityToLabels(t *testing.T) {
+	in := CreateIssueRequest{
+		Title:    "hi",
+		Status:   "in_progress",
+		Priority: "high",
+	}
+	out := BuildCreateIssueInput(in, nil)
+	if out.Title != "hi" {
+		t.Errorf("title = %q", out.Title)
+	}
+	hasStatus := false
+	hasPriority := false
+	for _, l := range out.Labels {
+		if l == "status::in_progress" {
+			hasStatus = true
+		}
+		if l == "priority::high" {
+			hasPriority = true
+		}
+	}
+	if !hasStatus {
+		t.Errorf("labels missing status::in_progress: %v", out.Labels)
+	}
+	if !hasPriority {
+		t.Errorf("labels missing priority::high: %v", out.Labels)
+	}
+}
+
+func TestBuildCreateIssueInput_AgentAssigneeToLabel(t *testing.T) {
+	in := CreateIssueRequest{
+		Title:        "hi",
+		Status:       "todo",
+		Priority:     "none",
+		AssigneeType: "agent",
+		AssigneeID:   "agent-uuid-1",
+	}
+	out := BuildCreateIssueInput(in, map[string]string{"agent-uuid-1": "builder"})
+	hasAgentLabel := false
+	for _, l := range out.Labels {
+		if l == "agent::builder" {
+			hasAgentLabel = true
+		}
+	}
+	if !hasAgentLabel {
+		t.Errorf("labels missing agent::builder: %v", out.Labels)
+	}
+	if len(out.AssigneeIDs) != 0 {
+		t.Errorf("AssigneeIDs should be empty when assigning to agent, got %v", out.AssigneeIDs)
+	}
+}
+
+func TestBuildCreateIssueInput_MemberAssigneeIgnoredInPhase3a(t *testing.T) {
+	// Phase 3b will resolve member UUID → GitLab user ID. Until then,
+	// member assignees are silently dropped.
+	in := CreateIssueRequest{
+		Title:        "hi",
+		Status:       "todo",
+		Priority:     "none",
+		AssigneeType: "member",
+		AssigneeID:   "user-uuid-1",
+	}
+	out := BuildCreateIssueInput(in, nil)
+	if len(out.AssigneeIDs) != 0 {
+		t.Errorf("AssigneeIDs should be empty for member assignee in 3a, got %v", out.AssigneeIDs)
+	}
+}
+
+func TestBuildCreateIssueInput_PriorityNoneOmitted(t *testing.T) {
+	// priority::none is the default — emitting the label clutters GitLab UI.
+	in := CreateIssueRequest{
+		Title:    "hi",
+		Status:   "todo",
+		Priority: "none",
+	}
+	out := BuildCreateIssueInput(in, nil)
+	for _, l := range out.Labels {
+		if l == "priority::none" {
+			t.Errorf("priority::none should not be emitted as a label; got %v", out.Labels)
+		}
+	}
+}

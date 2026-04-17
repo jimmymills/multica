@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/events"
+	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -63,6 +65,10 @@ type Handler struct {
 	// PublicURL is the externally-reachable base URL of this Multica server,
 	// used to build the gitlab webhook URL. Empty disables webhook registration.
 	PublicURL string
+
+	// GitlabResolver picks the right token (user PAT vs service PAT) for
+	// write requests. Non-nil only when GitlabEnabled is true.
+	GitlabResolver *gitlabsync.Resolver
 }
 
 func New(
@@ -113,6 +119,12 @@ func (h *Handler) SetBaseCtx(ctx context.Context) {
 // server boot.
 func (h *Handler) SetPublicURL(url string) {
 	h.PublicURL = url
+}
+
+// SetGitlabResolver wires the per-request token resolver. Called once by
+// NewRouter when GitLab is enabled, before any routes are registered.
+func (h *Handler) SetGitlabResolver(r *gitlabsync.Resolver) {
+	h.GitlabResolver = r
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -187,6 +199,22 @@ func (h *Handler) resolveActor(r *http.Request, userID, workspaceID string) (act
 	}
 
 	return "agent", agentID
+}
+
+// buildAgentUUIDSlugMap returns a map of agent UUID → slug for every agent
+// in the workspace. Slugs are derived from agent.Name (lowercased, spaces
+// → hyphens). Same convention as Phase 2a's read-side buildAgentSlugMap.
+func (h *Handler) buildAgentUUIDSlugMap(ctx context.Context, workspaceID pgtype.UUID) (map[string]string, error) {
+	rows, err := h.Queries.ListAgents(ctx, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(rows))
+	for _, row := range rows {
+		slug := strings.ToLower(strings.ReplaceAll(row.Name, " ", "-"))
+		out[uuidToString(row.ID)] = slug
+	}
+	return out, nil
 }
 
 func requireUserID(w http.ResponseWriter, r *http.Request) (string, bool) {

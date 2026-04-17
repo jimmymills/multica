@@ -67,7 +67,10 @@
     "./gitlab": "./gitlab/index.ts",
     "./gitlab/types": "./gitlab/types.ts",
     "./gitlab/queries": "./gitlab/queries.ts",
-    "./gitlab/mutations": "./gitlab/mutations.ts"
+    "./gitlab/mutations": "./gitlab/mutations.ts",
+    "./gitlab/user-types": "./gitlab/user-types.ts",
+    "./gitlab/user-queries": "./gitlab/user-queries.ts",
+    "./gitlab/user-mutations": "./gitlab/user-mutations.ts"
   },
   "dependencies": {
     "@tanstack/react-query": "catalog:",

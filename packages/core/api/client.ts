@@ -65,6 +65,7 @@ import type {
   ListAutopilotRunsResponse,
 } from "../types";
 import type { GitlabConnection, ConnectGitlabInput } from "../gitlab/types";
+import type { UserGitlabConnection, ConnectUserGitlabInput } from "../gitlab/user-types";
 import { type Logger, noopLogger } from "../logger";
 import { createRequestId } from "../utils";
 import { getCurrentSlug } from "../platform/workspace-storage";
@@ -899,5 +900,28 @@ export class ApiClient {
 
   async disconnectWorkspaceGitlab(workspaceId: string): Promise<void> {
     await this.fetch(`/api/workspaces/${workspaceId}/gitlab/connect`, { method: "DELETE" });
+  }
+
+  // Per-user GitLab PAT
+  async getUserGitlabConnection(wsId: string): Promise<UserGitlabConnection> {
+    return this.fetch(`/api/me/gitlab/connect`, {
+      method: "GET",
+      headers: { "X-Workspace-ID": wsId },
+    });
+  }
+
+  async connectUserGitlab(wsId: string, input: ConnectUserGitlabInput): Promise<UserGitlabConnection> {
+    return this.fetch(`/api/me/gitlab/connect`, {
+      method: "POST",
+      headers: { "X-Workspace-ID": wsId },
+      body: JSON.stringify(input),
+    });
+  }
+
+  async disconnectUserGitlab(wsId: string): Promise<void> {
+    await this.fetch(`/api/me/gitlab/connect`, {
+      method: "DELETE",
+      headers: { "X-Workspace-ID": wsId },
+    });
   }
 }
