@@ -11,6 +11,11 @@ import {
   useConnectWorkspaceGitlabMutation,
   useDisconnectWorkspaceGitlabMutation,
 } from "@multica/core/gitlab/mutations";
+import { useUserGitlabConnection } from "@multica/core/gitlab/user-queries";
+import {
+  useConnectUserGitlabMutation,
+  useDisconnectUserGitlabMutation,
+} from "@multica/core/gitlab/user-mutations";
 import { ApiError } from "@multica/core/api";
 
 export function GitlabTab() {
@@ -33,26 +38,32 @@ export function GitlabTab() {
 
   if (data && data.connection_status === "connected") {
     return (
-      <div className="space-y-4">
-        <h2 className="text-xl font-semibold">GitLab</h2>
-        <Card>
-          <CardContent className="space-y-3 pt-6">
-            <div>
-              <span className="text-muted-foreground">Project: </span>
-              <span className="font-medium">{data.gitlab_project_path}</span>
-            </div>
-            <div className="text-muted-foreground text-sm">
-              Service account user id: {data.service_token_user_id}
-            </div>
-            <Button
-              variant="destructive"
-              disabled={disconnectMu.isPending}
-              onClick={() => disconnectMu.mutate()}
-            >
-              {disconnectMu.isPending ? "Disconnecting…" : "Disconnect"}
-            </Button>
-          </CardContent>
-        </Card>
+      <div className="space-y-6">
+        <div className="space-y-4">
+          <h2 className="text-xl font-semibold">GitLab</h2>
+          <Card>
+            <CardContent className="space-y-3 pt-6">
+              <div>
+                <span className="text-muted-foreground">Project: </span>
+                <span className="font-medium">{data.gitlab_project_path}</span>
+              </div>
+              <div className="text-muted-foreground text-sm">
+                Service account user id: {data.service_token_user_id}
+              </div>
+              <Button
+                variant="destructive"
+                disabled={disconnectMu.isPending}
+                onClick={() => disconnectMu.mutate()}
+              >
+                {disconnectMu.isPending ? "Disconnecting…" : "Disconnect"}
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+        <div className="space-y-4">
+          <h3 className="text-lg font-semibold">Your personal GitLab connection</h3>
+          <UserGitlabSection workspaceId={wsId} />
+        </div>
       </div>
     );
   }
@@ -102,5 +113,74 @@ export function GitlabTab() {
         {connectMu.isPending ? "Connecting…" : "Connect"}
       </Button>
     </form>
+  );
+}
+
+function UserGitlabSection({ workspaceId }: { workspaceId: string }) {
+  const { data, isLoading } = useUserGitlabConnection(workspaceId);
+  const connectMu = useConnectUserGitlabMutation(workspaceId);
+  const disconnectMu = useDisconnectUserGitlabMutation(workspaceId);
+  const [token, setToken] = useState("");
+
+  if (isLoading) {
+    return <div className="text-muted-foreground text-sm">Loading…</div>;
+  }
+
+  if (data?.connected) {
+    return (
+      <Card>
+        <CardContent className="space-y-3 pt-6">
+          <div>
+            <span className="text-muted-foreground">Connected as: </span>
+            <span className="font-medium">@{data.gitlab_username}</span>
+          </div>
+          <Button
+            variant="destructive"
+            disabled={disconnectMu.isPending}
+            onClick={() => disconnectMu.mutate()}
+          >
+            {disconnectMu.isPending ? "Disconnecting…" : "Disconnect"}
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardContent className="space-y-3 pt-6">
+        <p className="text-sm text-muted-foreground">
+          Connect your personal GitLab account so your writes (issue creation, comments,
+          status changes) post as you instead of as the workspace service account.
+        </p>
+        <form
+          className="space-y-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            connectMu.mutate({ token });
+          }}
+        >
+          <Label htmlFor="user-gitlab-token">Personal access token</Label>
+          <Input
+            id="user-gitlab-token"
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="glpat-…"
+            required
+          />
+          {connectMu.isError ? (
+            <div className="text-destructive text-sm">
+              {connectMu.error instanceof ApiError
+                ? connectMu.error.message
+                : "Connection failed"}
+            </div>
+          ) : null}
+          <Button type="submit" disabled={connectMu.isPending || !token}>
+            {connectMu.isPending ? "Connecting…" : "Connect personal account"}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
   );
 }

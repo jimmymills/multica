@@ -17,19 +17,27 @@ vi.mock("@multica/core/api", async () => {
       getWorkspaceGitlabConnection: vi.fn(),
       connectWorkspaceGitlab: vi.fn(),
       disconnectWorkspaceGitlab: vi.fn(),
+      getUserGitlabConnection: vi.fn(),
+      connectUserGitlab: vi.fn(),
+      disconnectUserGitlab: vi.fn(),
     },
   };
 });
 
 import { api } from "@multica/core/api";
 
-function renderTab() {
+function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
       <GitlabTab />
     </QueryClientProvider>,
   );
+}
+
+// Keep old helper name for backwards compat with existing tests
+function renderTab() {
+  return renderPage();
 }
 
 describe("GitlabTab", () => {
@@ -54,6 +62,7 @@ describe("GitlabTab", () => {
       service_token_user_id: 1,
       connection_status: "connected",
     });
+    (api.getUserGitlabConnection as ReturnType<typeof vi.fn>).mockResolvedValue({ connected: false });
     renderTab();
     await userEvent.type(await screen.findByLabelText(/project/i), "team/app");
     await userEvent.type(screen.getByLabelText(/token/i), "glpat-abc");
@@ -73,8 +82,38 @@ describe("GitlabTab", () => {
       service_token_user_id: 1,
       connection_status: "connected",
     });
+    (api.getUserGitlabConnection as ReturnType<typeof vi.fn>).mockResolvedValue({ connected: false });
     renderTab();
     expect(await screen.findByText(/group\/repo/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /disconnect/i })).toBeInTheDocument();
+  });
+
+  it("renders the personal connection form when workspace connected + user not connected", async () => {
+    (api.getWorkspaceGitlabConnection as ReturnType<typeof vi.fn>).mockResolvedValue({
+      workspace_id: "ws-1",
+      gitlab_project_id: 9,
+      gitlab_project_path: "group/repo",
+      service_token_user_id: 1,
+      connection_status: "connected",
+    });
+    (api.getUserGitlabConnection as ReturnType<typeof vi.fn>).mockResolvedValue({ connected: false });
+    renderPage();
+    expect(await screen.findByText(/connect your personal gitlab/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/personal access token/i)).toBeInTheDocument();
+  });
+
+  it("renders 'connected as @username' when user has connected", async () => {
+    (api.getWorkspaceGitlabConnection as ReturnType<typeof vi.fn>).mockResolvedValue({
+      workspace_id: "ws-1",
+      gitlab_project_id: 9,
+      gitlab_project_path: "group/repo",
+      service_token_user_id: 1,
+      connection_status: "connected",
+    });
+    (api.getUserGitlabConnection as ReturnType<typeof vi.fn>).mockResolvedValue({
+      connected: true, gitlab_username: "alice",
+    });
+    renderPage();
+    expect(await screen.findByText(/@alice/)).toBeInTheDocument();
   });
 });
