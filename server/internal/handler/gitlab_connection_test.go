@@ -1,0 +1,112 @@
+package handler
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/realtime"
+	"github.com/multica-ai/multica/server/internal/service"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/gitlab"
+	"github.com/multica-ai/multica/server/pkg/secrets"
+)
+
+// buildHandlerWithGitlab returns a Handler whose GitLab client points at a fake server URL.
+// Reuses the existing testPool so DB queries work against the same fixtures.
+func buildHandlerWithGitlab(t *testing.T, fakeGitlabURL string) *Handler {
+	t.Helper()
+	key := make([]byte, 32)
+	cipher, err := secrets.NewCipher(key)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	client := gitlab.NewClient(fakeGitlabURL, http.DefaultClient)
+	hub := realtime.NewHub()
+	go hub.Run()
+	bus := events.New()
+	emailSvc := service.NewEmailService()
+	return New(
+		db.New(testPool), testPool, hub, bus, emailSvc, nil, nil,
+		cipher, client, true,
+	)
+}
+
+func TestConnectGitlabWorkspace_Success(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v4/user":
+			w.Write([]byte(`{"id": 555, "username": "svc-bot", "name": "Service Bot"}`))
+		case "/api/v4/projects/42":
+			w.Write([]byte(`{"id": 42, "path_with_namespace": "team/app"}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	// Reset connection state.
+	h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+
+	body, _ := json.Marshal(map[string]string{
+		"project": "42",
+		"token":   "glpat-abc",
+	})
+	req := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/api/workspaces/%s/gitlab/connect", testWorkspaceID), bytes.NewReader(body))
+	req.Header.Set("X-User-ID", testUserID)
+	req = withURLParam(req, "workspaceID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+
+	h.ConnectGitlabWorkspace(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var got map[string]any
+	json.Unmarshal(rr.Body.Bytes(), &got)
+	if got["gitlab_project_path"] != "team/app" {
+		t.Errorf("gitlab_project_path = %v", got["gitlab_project_path"])
+	}
+	if _, hasTok := got["service_token_encrypted"]; hasTok {
+		t.Errorf("response leaks service_token_encrypted field: %+v", got)
+	}
+	if _, hasTok := got["pat_encrypted"]; hasTok {
+		t.Errorf("response leaks pat_encrypted field: %+v", got)
+	}
+
+	// Clean up.
+	h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+}
+
+func TestConnectGitlabWorkspace_BadToken(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message": "401 Unauthorized"}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+
+	body, _ := json.Marshal(map[string]string{"project": "42", "token": "bad"})
+	req := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/api/workspaces/%s/gitlab/connect", testWorkspaceID), bytes.NewReader(body))
+	req.Header.Set("X-User-ID", testUserID)
+	req = withURLParam(req, "workspaceID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+
+	h.ConnectGitlabWorkspace(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; body = %s", rr.Code, rr.Body.String())
+	}
+}
