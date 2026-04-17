@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -873,5 +875,134 @@ func TestBatchResult_ShapeAndJSON(t *testing.T) {
 	want := `{"succeeded":[{"id":"abc","issue":null}],"failed":[{"id":"def","error_code":"GITLAB_403","message":"forbidden"}]}`
 	if string(body) != want {
 		t.Errorf("json = %s\nwant  %s", body, want)
+	}
+}
+
+// TestBatchUpdateIssues_ContinueOnError verifies that when one item's GitLab
+// PUT fails (403), the handler records the failure but continues to apply the
+// remaining items. Returns HTTP 207 Multi-Status because results are mixed.
+func TestBatchUpdateIssues_ContinueOnError(t *testing.T) {
+	ctx := context.Background()
+
+	var gitlabCalls int
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gitlabCalls++
+		// The "bad" issue is keyed by its GitLab IID in the path (401).
+		if strings.Contains(r.URL.Path, "/issues/401") {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"forbidden"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":9001,"iid":400,"title":"T","state":"opened","updated_at":"2026-04-17T13:00:00Z","labels":["status::done"]}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	seedGitlabWriteThroughFixture(t, h)
+	t.Cleanup(func() {
+		h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	})
+
+	goodID := uuid.New().String()
+	badID := uuid.New().String()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue (id, workspace_id, number, title, description, status, priority,
+		 gitlab_iid, gitlab_project_id, gitlab_issue_id, external_updated_at,
+		 creator_type, creator_id, position)
+		 VALUES ($1::uuid, $2::uuid, 2001, 'A', '', 'todo', 'none', 400, 42, 9001, '2026-04-17T12:00:00Z', 'member', $3::uuid, 0),
+		        ($4::uuid, $2::uuid, 2002, 'B', '', 'todo', 'none', 401, 42, 9002, '2026-04-17T12:00:00Z', 'member', $3::uuid, 0)`,
+		goodID, testWorkspaceID, testUserID, badID); err != nil {
+		t.Fatalf("seed issues: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM issue WHERE id IN ($1::uuid, $2::uuid)`, goodID, badID)
+	})
+
+	body := fmt.Sprintf(`{"issue_ids":["%s","%s"],"updates":{"status":"done"}}`, goodID, badID)
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/batch-update", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	rec := httptest.NewRecorder()
+
+	h.BatchUpdateIssues(rec, req)
+
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207, body = %s", rec.Code, rec.Body.String())
+	}
+	var result BatchWriteResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Succeeded) != 1 || result.Succeeded[0].ID != goodID {
+		t.Errorf("succeeded = %+v, want 1 item with id=%s", result.Succeeded, goodID)
+	}
+	if len(result.Failed) != 1 || result.Failed[0].ID != badID {
+		t.Errorf("failed = %+v, want 1 item with id=%s", result.Failed, badID)
+	}
+	if len(result.Failed) == 1 && result.Failed[0].ErrorCode != "GITLAB_403" {
+		t.Errorf("error_code = %s, want GITLAB_403", result.Failed[0].ErrorCode)
+	}
+	if gitlabCalls != 2 {
+		t.Errorf("gitlab call count = %d, want 2 (both items attempted)", gitlabCalls)
+	}
+}
+
+// TestBatchUpdateIssues_AllSuccessReturns200 verifies that when every item
+// succeeds, the response is HTTP 200 (not 207), with all items in the
+// Succeeded list and Failed empty.
+func TestBatchUpdateIssues_AllSuccessReturns200(t *testing.T) {
+	ctx := context.Background()
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":9001,"iid":402,"title":"T","state":"opened","updated_at":"2026-04-17T13:00:00Z","labels":["status::done"]}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	seedGitlabWriteThroughFixture(t, h)
+	t.Cleanup(func() {
+		h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	})
+
+	aID := uuid.New().String()
+	bID := uuid.New().String()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue (id, workspace_id, number, title, description, status, priority,
+		 gitlab_iid, gitlab_project_id, gitlab_issue_id, external_updated_at,
+		 creator_type, creator_id, position)
+		 VALUES ($1::uuid, $2::uuid, 2003, 'A', '', 'todo', 'none', 402, 42, 9001, '2026-04-17T12:00:00Z', 'member', $3::uuid, 0),
+		        ($4::uuid, $2::uuid, 2004, 'B', '', 'todo', 'none', 403, 42, 9002, '2026-04-17T12:00:00Z', 'member', $3::uuid, 0)`,
+		aID, testWorkspaceID, testUserID, bID); err != nil {
+		t.Fatalf("seed issues: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(),
+			`DELETE FROM issue WHERE id IN ($1::uuid, $2::uuid)`, aID, bID)
+	})
+
+	body := fmt.Sprintf(`{"issue_ids":["%s","%s"],"updates":{"status":"done"}}`, aID, bID)
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/batch-update", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	rec := httptest.NewRecorder()
+
+	h.BatchUpdateIssues(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (all-success), body = %s", rec.Code, rec.Body.String())
+	}
+	var result BatchWriteResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(result.Succeeded) != 2 {
+		t.Errorf("succeeded = %d, want 2", len(result.Succeeded))
+	}
+	if len(result.Failed) != 0 {
+		t.Errorf("failed = %+v, want empty on all-success", result.Failed)
 	}
 }
