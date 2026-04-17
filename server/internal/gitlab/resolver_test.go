@@ -39,8 +39,13 @@ func stubDecrypt(prefix string) TokenDecrypter {
 	}
 }
 
-// validUUID returns a syntactically valid UUID for tests.
-const validUUID = "00000000-0000-0000-0000-000000000001"
+// Distinct workspace vs. user UUIDs so a future transposition bug in the
+// resolver (passing the workspace UUID where the user UUID belongs, or vice
+// versa) would surface rather than silently pass.
+const (
+	workspaceUUID = "00000000-0000-0000-0000-000000000001"
+	userUUID      = "00000000-0000-0000-0000-000000000002"
+)
 
 func TestResolveTokenForWrite_HumanWithPATPicksUserPAT(t *testing.T) {
 	q := &fakeResolverQueries{
@@ -53,7 +58,7 @@ func TestResolveTokenForWrite_HumanWithPATPicksUserPAT(t *testing.T) {
 		},
 	}
 	r := NewResolver(q, stubDecrypt("dec"))
-	tok, src, err := r.ResolveTokenForWrite(context.Background(), validUUID, "member", validUUID)
+	tok, src, err := r.ResolveTokenForWrite(context.Background(), workspaceUUID, "member", userUUID)
 	if err != nil {
 		t.Fatalf("ResolveTokenForWrite: %v", err)
 	}
@@ -73,7 +78,7 @@ func TestResolveTokenForWrite_HumanWithoutPATFallsBackToServicePAT(t *testing.T)
 		userConn: nil, // user hasn't connected
 	}
 	r := NewResolver(q, stubDecrypt("dec"))
-	tok, src, err := r.ResolveTokenForWrite(context.Background(), validUUID, "member", validUUID)
+	tok, src, err := r.ResolveTokenForWrite(context.Background(), workspaceUUID, "member", userUUID)
 	if err != nil {
 		t.Fatalf("ResolveTokenForWrite: %v", err)
 	}
@@ -97,7 +102,7 @@ func TestResolveTokenForWrite_AgentAlwaysUsesServicePAT(t *testing.T) {
 		},
 	}
 	r := NewResolver(q, stubDecrypt("dec"))
-	tok, src, err := r.ResolveTokenForWrite(context.Background(), validUUID, "agent", validUUID)
+	tok, src, err := r.ResolveTokenForWrite(context.Background(), workspaceUUID, "agent", userUUID)
 	if err != nil {
 		t.Fatalf("ResolveTokenForWrite: %v", err)
 	}
@@ -112,18 +117,11 @@ func TestResolveTokenForWrite_AgentAlwaysUsesServicePAT(t *testing.T) {
 func TestResolveTokenForWrite_NoWorkspaceConnection(t *testing.T) {
 	q := &fakeResolverQueries{} // both nil
 	r := NewResolver(q, stubDecrypt("dec"))
-	_, _, err := r.ResolveTokenForWrite(context.Background(), validUUID, "member", validUUID)
+	_, _, err := r.ResolveTokenForWrite(context.Background(), workspaceUUID, "member", userUUID)
 	if err == nil {
 		t.Fatalf("expected error when workspace has no connection")
 	}
 }
-
-// Use distinct UUIDs for workspace and user to keep this test independent
-// of Minor M2's rename of validUUID → workspaceUUID/userUUID.
-const (
-	rejectWorkspaceUUID = "00000000-0000-0000-0000-00000000aaaa"
-	rejectUserUUID      = "00000000-0000-0000-0000-00000000bbbb"
-)
 
 func TestResolveTokenForWrite_RejectsUnknownActorType(t *testing.T) {
 	q := &fakeResolverQueries{
@@ -147,7 +145,7 @@ func TestResolveTokenForWrite_RejectsUnknownActorType(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := r.ResolveTokenForWrite(context.Background(), rejectWorkspaceUUID, tc.actorType, rejectUserUUID)
+			_, _, err := r.ResolveTokenForWrite(context.Background(), workspaceUUID, tc.actorType, userUUID)
 			if err == nil {
 				t.Fatalf("expected error for actorType %q, got nil", tc.actorType)
 			}
