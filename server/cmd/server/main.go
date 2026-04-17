@@ -32,8 +32,18 @@ func main() {
 		slog.Warn("RESEND_API_KEY is not set — email verification codes will be printed to the log instead of emailed.")
 	}
 
+	gitlabEnabled := os.Getenv("MULTICA_GITLAB_ENABLED") == "true"
+	gitlabClient := gitlab.NewClient(gitlab.DefaultBaseURL, &http.Client{Timeout: 30 * time.Second})
+
 	secretsCipher, sErr := secrets.Load()
 	if sErr != nil {
+		// When GitLab is enabled, the cipher will be used to encrypt PATs that
+		// must survive restarts. Falling back to an ephemeral key would mean
+		// stored PATs become unrecoverable on the next boot — fail fast instead.
+		if gitlabEnabled {
+			slog.Error("MULTICA_SECRETS_KEY is required when MULTICA_GITLAB_ENABLED=true (otherwise stored credentials become unrecoverable on restart)", "error", sErr)
+			os.Exit(1)
+		}
 		slog.Warn("MULTICA_SECRETS_KEY not configured; generating an ephemeral dev key. Set MULTICA_SECRETS_KEY for production.", "error", sErr)
 		ephemeral := make([]byte, 32)
 		if _, err := cryptorand.Read(ephemeral); err != nil {
@@ -42,9 +52,6 @@ func main() {
 		}
 		secretsCipher, _ = secrets.NewCipher(ephemeral)
 	}
-
-	gitlabEnabled := os.Getenv("MULTICA_GITLAB_ENABLED") == "true"
-	gitlabClient := gitlab.NewClient(gitlab.DefaultBaseURL, &http.Client{Timeout: 30 * time.Second})
 
 	port := os.Getenv("PORT")
 	if port == "" {
