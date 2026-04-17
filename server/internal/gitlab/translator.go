@@ -155,3 +155,43 @@ func TranslateAward(in gitlabapi.AwardEmoji) AwardValues {
 		UpdatedAt:    in.UpdatedAt,
 	}
 }
+
+// CreateIssueRequest mirrors the subset of Multica's create-issue HTTP body
+// we translate to GitLab. Defined here so the translator stays handler-free.
+type CreateIssueRequest struct {
+	Title        string
+	Description  string
+	Status       string // backlog|todo|in_progress|in_review|done|blocked|cancelled
+	Priority     string // urgent|high|medium|low|none
+	AssigneeType string // "" | "member" | "agent"
+	AssigneeID   string // UUID string when AssigneeType is set
+	DueDate      string // YYYY-MM-DD or ""
+	Labels       []string
+}
+
+// BuildCreateIssueInput converts a Multica create-issue request into the
+// GitLab REST body. agentSlugByUUID maps Multica agent UUID → slug so we
+// can express agent assignment as the agent::<slug> label.
+//
+// Phase 3a behaviour: member assignees are dropped (no GitLab user mapping
+// yet — Phase 3b adds it). Agent assignees become the corresponding label.
+func BuildCreateIssueInput(req CreateIssueRequest, agentSlugByUUID map[string]string) gitlabapi.CreateIssueInput {
+	labels := append([]string(nil), req.Labels...)
+	if req.Status != "" {
+		labels = append(labels, "status::"+req.Status)
+	}
+	if req.Priority != "" && req.Priority != "none" {
+		labels = append(labels, "priority::"+req.Priority)
+	}
+	if req.AssigneeType == "agent" && req.AssigneeID != "" && agentSlugByUUID != nil {
+		if slug, ok := agentSlugByUUID[req.AssigneeID]; ok {
+			labels = append(labels, "agent::"+slug)
+		}
+	}
+	return gitlabapi.CreateIssueInput{
+		Title:       req.Title,
+		Description: req.Description,
+		Labels:      labels,
+		DueDate:     req.DueDate,
+	}
+}
