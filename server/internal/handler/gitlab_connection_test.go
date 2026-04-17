@@ -459,6 +459,56 @@ func TestGitlabConnectedWorkspace_WriteReturns501(t *testing.T) {
 	}
 }
 
+// I-1 fix: comment write routes also need the 501 stopgap.
+// The /api/comments/{commentId} subrouter doesn't carry a workspace ID in
+// its URL — the middleware falls back to the X-Workspace-ID header (set by
+// the workspace-scoped middleware groups in the real router).
+func TestGitlabConnectedWorkspace_CommentWriteReturns501(t *testing.T) {
+	h := buildHandlerWithGitlab(t, "http://unused")
+	h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	h.Queries.CreateWorkspaceGitlabConnection(context.Background(), db.CreateWorkspaceGitlabConnectionParams{
+		WorkspaceID:           parseUUID(testWorkspaceID),
+		GitlabProjectID:       42,
+		GitlabProjectPath:     "team/app",
+		ServiceTokenEncrypted: []byte("x"),
+		ServiceTokenUserID:    1,
+		ConnectionStatus:      "connected",
+	})
+	defer h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+
+	r := chi.NewRouter()
+	r.Route("/api/comments/{commentId}", func(r chi.Router) {
+		r.Use(middleware.GitlabWritesBlocked(h.Queries))
+		r.Put("/", h.UpdateComment)
+		r.Delete("/", h.DeleteComment)
+		r.Post("/reactions", h.AddReaction)
+		r.Delete("/reactions", h.RemoveReaction)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"update", http.MethodPut, "/api/comments/00000000-0000-0000-0000-000000000000/", `{"content":"x"}`},
+		{"delete", http.MethodDelete, "/api/comments/00000000-0000-0000-0000-000000000000/", ``},
+		{"add reaction", http.MethodPost, "/api/comments/00000000-0000-0000-0000-000000000000/reactions", `{"emoji":"thumbsup"}`},
+		{"remove reaction", http.MethodDelete, "/api/comments/00000000-0000-0000-0000-000000000000/reactions", `{"emoji":"thumbsup"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("X-User-ID", testUserID)
+			req.Header.Set("X-Workspace-ID", testWorkspaceID)
+			rr := httptest.NewRecorder()
+			r.ServeHTTP(rr, req)
+			if rr.Code != http.StatusNotImplemented {
+				t.Fatalf("%s status = %d, want 501; body = %s", tc.name, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 // M1: feature-flag gate returns 404 from each of the three handlers.
 func TestGitlabHandlers_DisabledReturns404(t *testing.T) {
 	h := buildHandlerGitlabDisabled(t)
