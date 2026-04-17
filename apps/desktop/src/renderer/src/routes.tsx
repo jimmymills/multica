@@ -18,8 +18,8 @@ import { SkillsPage } from "@multica/views/skills";
 import { DaemonRuntimeCard } from "./components/daemon-runtime-card";
 import { AgentsPage } from "@multica/views/agents";
 import { InboxPage } from "@multica/views/inbox";
-import { SettingsPage } from "@multica/views/settings";
-import { Server } from "lucide-react";
+import { SettingsPage, GitlabTab } from "@multica/views/settings";
+import { Server, GitBranch } from "lucide-react";
 import { DaemonSettingsTab } from "./components/daemon-settings-tab";
 import { WorkspaceRouteLayout } from "./components/workspace-route-layout";
 
@@ -131,6 +131,18 @@ export const appRoutes: RouteObject[] = [
                     content: <DaemonSettingsTab />,
                   },
                 ]}
+                extraWorkspaceTabs={
+                  import.meta.env.VITE_GITLAB_ENABLED === "true"
+                    ? [
+                        {
+                          value: "gitlab",
+                          label: "GitLab",
+                          icon: GitBranch,
+                          content: <GitlabTab />,
+                        },
+                      ]
+                    : []
+                }
               />
             ),
             handle: { title: "Settings" },
