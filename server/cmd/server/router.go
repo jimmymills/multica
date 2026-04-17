@@ -254,7 +254,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 				r.Post("/", h.CreateIssue)
 
 				// Other root writes — gated until Phase 3b migrates them.
-				r.With(gw).Post("/batch-update", h.BatchUpdateIssues)
+				r.Post("/batch-update", h.BatchUpdateIssues)
 				r.With(gw).Post("/batch-delete", h.BatchDeleteIssues)
 
 				r.Route("/{id}", func(r chi.Router) {
