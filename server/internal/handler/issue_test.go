@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/google/uuid"
 	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -151,6 +152,216 @@ func TestCreateIssue_WriteThroughHumanWithPATUsesUserPAT(t *testing.T) {
 	}
 	if capturedToken != "user-token-alice" {
 		t.Errorf("PRIVATE-TOKEN = %q, want user-token-alice", capturedToken)
+	}
+}
+
+// seedGitlabWriteThroughFixture prepares a workspace_gitlab_connection row and
+// attaches a real resolver to the handler so CreateIssue takes the
+// write-through branch. Shared by the parent/project/attachments blocker tests.
+func seedGitlabWriteThroughFixture(t *testing.T, h *Handler) {
+	t.Helper()
+	encrypted, _ := h.Secrets.Encrypt([]byte("svc-token-xyz"))
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO workspace_gitlab_connection (
+			workspace_id, gitlab_project_id, gitlab_project_path,
+			service_token_encrypted, service_token_user_id, connection_status
+		) VALUES ($1, 42, 'g/a', $2, 1, 'connected')
+		ON CONFLICT (workspace_id) DO UPDATE SET
+			gitlab_project_id = EXCLUDED.gitlab_project_id,
+			service_token_encrypted = EXCLUDED.service_token_encrypted,
+			service_token_user_id = EXCLUDED.service_token_user_id
+	`, testWorkspaceID, encrypted); err != nil {
+		t.Fatalf("seed workspace_gitlab_connection: %v", err)
+	}
+	h.SetGitlabResolver(gitlabsync.NewResolver(h.Queries, func(_ context.Context, b []byte) (string, error) {
+		plain, err := h.Secrets.Decrypt(b)
+		if err != nil {
+			return "", err
+		}
+		return string(plain), nil
+	}))
+}
+
+func TestCreateIssue_WriteThroughThreadsParentIssueID(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v4/projects/42/issues" && r.Method == http.MethodPost {
+			w.Write([]byte(`{"id":9910,"iid":110,"title":"Sub-issue","state":"opened",
+				"labels":["status::todo","priority::medium"],"updated_at":"2026-04-17T15:00:00Z"}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	defer testPool.Exec(context.Background(), `DELETE FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid IN (110)`, testWorkspaceID)
+
+	// Seed a native parent issue in the same workspace.
+	var parentID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'blocker-parent', 'todo', 'none', $2, 'member', 9001, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&parentID); err != nil {
+		t.Fatalf("seed parent issue: %v", err)
+	}
+	defer testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, parentID)
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	body, _ := json.Marshal(map[string]any{
+		"title":           "Sub-issue",
+		"status":          "todo",
+		"priority":        "medium",
+		"parent_issue_id": parentID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+
+	h.CreateIssue(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	// The cache row must have parent_issue_id set to the pre-seeded parent.
+	var gotParent string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT parent_issue_id FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid = 110`,
+		testWorkspaceID).Scan(&gotParent); err != nil {
+		t.Fatalf("query cache row parent_issue_id: %v", err)
+	}
+	if gotParent != parentID {
+		t.Errorf("cache row parent_issue_id = %q, want %q", gotParent, parentID)
+	}
+}
+
+func TestCreateIssue_WriteThroughThreadsProjectID(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v4/projects/42/issues" && r.Method == http.MethodPost {
+			w.Write([]byte(`{"id":9911,"iid":111,"title":"Issue with project","state":"opened",
+				"labels":["status::todo","priority::medium"],"updated_at":"2026-04-17T15:00:00Z"}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	defer testPool.Exec(context.Background(), `DELETE FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid = 111`, testWorkspaceID)
+
+	// Seed a native project in the same workspace.
+	var projectID string
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO project (workspace_id, title)
+		VALUES ($1, 'blocker-project')
+		RETURNING id
+	`, testWorkspaceID).Scan(&projectID); err != nil {
+		t.Fatalf("seed project: %v", err)
+	}
+	defer testPool.Exec(context.Background(), `DELETE FROM project WHERE id = $1`, projectID)
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	body, _ := json.Marshal(map[string]any{
+		"title":      "Issue with project",
+		"status":     "todo",
+		"priority":   "medium",
+		"project_id": projectID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+
+	h.CreateIssue(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	var gotProject string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT project_id FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid = 111`,
+		testWorkspaceID).Scan(&gotProject); err != nil {
+		t.Fatalf("query cache row project_id: %v", err)
+	}
+	if gotProject != projectID {
+		t.Errorf("cache row project_id = %q, want %q", gotProject, projectID)
+	}
+}
+
+func TestCreateIssue_WriteThroughLinksAttachments(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v4/projects/42/issues" && r.Method == http.MethodPost {
+			w.Write([]byte(`{"id":9912,"iid":112,"title":"Issue with attachment","state":"opened",
+				"labels":["status::todo","priority::medium"],"updated_at":"2026-04-17T15:00:00Z"}`))
+			return
+		}
+		w.Write([]byte(`{}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	defer testPool.Exec(context.Background(), `DELETE FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid = 112`, testWorkspaceID)
+
+	// Pre-upload an unattached attachment (issue_id IS NULL).
+	attachmentUUID := uuid.New().String()
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO attachment (id, workspace_id, uploader_type, uploader_id, filename, url, content_type, size_bytes)
+		VALUES ($1::uuid, $2, 'member', $3, 'note.txt', 'https://cdn.example.com/note.txt', 'text/plain', 11)
+	`, attachmentUUID, testWorkspaceID, testUserID); err != nil {
+		t.Fatalf("seed attachment: %v", err)
+	}
+	defer testPool.Exec(context.Background(), `DELETE FROM attachment WHERE id = $1::uuid`, attachmentUUID)
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	body, _ := json.Marshal(map[string]any{
+		"title":          "Issue with attachment",
+		"status":         "todo",
+		"priority":       "medium",
+		"attachment_ids": []string{attachmentUUID},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/issues?workspace_id="+testWorkspaceID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+
+	h.CreateIssue(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+
+	// Fetch the newly created cache row id.
+	var issueID string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT id FROM issue WHERE workspace_id = $1::uuid AND gitlab_iid = 112`,
+		testWorkspaceID).Scan(&issueID); err != nil {
+		t.Fatalf("query cache row id: %v", err)
+	}
+
+	// The attachment must now point at the new issue.
+	var linkedIssueID string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT issue_id FROM attachment WHERE id = $1::uuid`,
+		attachmentUUID).Scan(&linkedIssueID); err != nil {
+		t.Fatalf("query attachment issue_id: %v", err)
+	}
+	if linkedIssueID != issueID {
+		t.Errorf("attachment issue_id = %q, want %q", linkedIssueID, issueID)
 	}
 }
 

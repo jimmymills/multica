@@ -939,6 +939,48 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			}
 			cacheRow.Number = issueNumber
 
+			// Patch Multica-native fields that UpsertIssueFromGitlab doesn't
+			// carry (parent_issue_id, project_id). The upsert stays "from
+			// GitLab"; these fields are Multica-owned and must be threaded in
+			// separately so sub-issue + project links work on connected
+			// workspaces. Uses the existing UpdateIssue sqlc query, passing
+			// the just-upserted row's values through COALESCE/narg slots so
+			// only parent/project actually change.
+			if parentIssueID.Valid || projectID.Valid {
+				patched, err := qtxGL.UpdateIssue(r.Context(), db.UpdateIssueParams{
+					ID:            cacheRow.ID,
+					AssigneeType:  cacheRow.AssigneeType,
+					AssigneeID:    cacheRow.AssigneeID,
+					DueDate:       cacheRow.DueDate,
+					ParentIssueID: parentIssueID,
+					ProjectID:     projectID,
+				})
+				if err != nil {
+					slog.Error("patch parent/project on gitlab cache row", "error", err)
+					writeError(w, http.StatusInternalServerError, "failed to create issue")
+					return
+				}
+				cacheRow = patched
+			}
+
+			// Link any pre-uploaded attachments to this issue inside the same
+			// txn so a partial failure rolls the whole thing back.
+			if len(req.AttachmentIDs) > 0 {
+				attachmentUUIDs := make([]pgtype.UUID, len(req.AttachmentIDs))
+				for i, id := range req.AttachmentIDs {
+					attachmentUUIDs[i] = parseUUID(id)
+				}
+				if err := qtxGL.LinkAttachmentsToIssue(r.Context(), db.LinkAttachmentsToIssueParams{
+					IssueID:     cacheRow.ID,
+					WorkspaceID: cacheRow.WorkspaceID,
+					Column3:     attachmentUUIDs,
+				}); err != nil {
+					slog.Error("link attachments to gitlab issue", "error", err)
+					writeError(w, http.StatusInternalServerError, "failed to create issue")
+					return
+				}
+			}
+
 			if err := glTx.Commit(r.Context()); err != nil {
 				slog.Error("commit gitlab write-through tx", "error", err)
 				writeError(w, http.StatusInternalServerError, "failed to create issue")
@@ -947,6 +989,22 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 			prefix := h.getIssuePrefix(r.Context(), cacheRow.WorkspaceID)
 			resp := issueToResponse(cacheRow, prefix)
+
+			// Mirror the legacy path: when attachments were linked, fetch them
+			// so the response carries the populated Attachments slice.
+			if len(req.AttachmentIDs) > 0 {
+				attachments, err := h.Queries.ListAttachmentsByIssue(r.Context(), db.ListAttachmentsByIssueParams{
+					IssueID:     cacheRow.ID,
+					WorkspaceID: cacheRow.WorkspaceID,
+				})
+				if err == nil && len(attachments) > 0 {
+					resp.Attachments = make([]AttachmentResponse, len(attachments))
+					for i, a := range attachments {
+						resp.Attachments[i] = h.attachmentToResponse(a)
+					}
+				}
+			}
+
 			h.publish(protocol.EventIssueCreated, workspaceID, actorType, actorID, map[string]any{"issue": resp})
 			writeJSON(w, http.StatusCreated, resp)
 			return
