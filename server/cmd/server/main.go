@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/gitlab"
+	"github.com/multica-ai/multica/server/pkg/secrets"
 )
 
 func main() {
@@ -28,6 +31,20 @@ func main() {
 	if os.Getenv("RESEND_API_KEY") == "" {
 		slog.Warn("RESEND_API_KEY is not set — email verification codes will be printed to the log instead of emailed.")
 	}
+
+	secretsCipher, sErr := secrets.Load()
+	if sErr != nil {
+		slog.Warn("MULTICA_SECRETS_KEY not configured; generating an ephemeral dev key. Set MULTICA_SECRETS_KEY for production.", "error", sErr)
+		ephemeral := make([]byte, 32)
+		if _, err := cryptorand.Read(ephemeral); err != nil {
+			slog.Error("failed to generate ephemeral secrets key", "error", err)
+			os.Exit(1)
+		}
+		secretsCipher, _ = secrets.NewCipher(ephemeral)
+	}
+
+	gitlabEnabled := os.Getenv("MULTICA_GITLAB_ENABLED") == "true"
+	gitlabClient := gitlab.NewClient(gitlab.DefaultBaseURL, &http.Client{Timeout: 30 * time.Second})
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -67,7 +84,7 @@ func main() {
 	registerActivityListeners(bus, queries)
 	registerNotificationListeners(bus, queries)
 
-	r := NewRouter(pool, hub, bus)
+	r := NewRouter(pool, hub, bus, secretsCipher, gitlabClient, gitlabEnabled)
 
 	srv := &http.Server{
 		Addr:    ":" + port,

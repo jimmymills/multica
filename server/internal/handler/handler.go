@@ -19,6 +19,8 @@ import (
 	"github.com/multica-ai/multica/server/internal/storage"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/gitlab"
+	"github.com/multica-ai/multica/server/pkg/secrets"
 )
 
 type txStarter interface {
@@ -44,9 +46,23 @@ type Handler struct {
 	UpdateStore      *UpdateStore
 	Storage          storage.Storage
 	CFSigner         *auth.CloudFrontSigner
+	Secrets          *secrets.Cipher
+	Gitlab           *gitlab.Client
+	GitlabEnabled    bool
 }
 
-func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *events.Bus, emailService *service.EmailService, store storage.Storage, cfSigner *auth.CloudFrontSigner) *Handler {
+func New(
+	queries *db.Queries,
+	txStarter txStarter,
+	hub *realtime.Hub,
+	bus *events.Bus,
+	emailService *service.EmailService,
+	store storage.Storage,
+	cfSigner *auth.CloudFrontSigner,
+	secretsCipher *secrets.Cipher,
+	gitlabClient *gitlab.Client,
+	gitlabEnabled bool,
+) *Handler {
 	var executor dbExecutor
 	if candidate, ok := txStarter.(dbExecutor); ok {
 		executor = candidate
@@ -66,6 +82,9 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		UpdateStore:      NewUpdateStore(),
 		Storage:          store,
 		CFSigner:         cfSigner,
+		Secrets:          secretsCipher,
+		Gitlab:           gitlabClient,
+		GitlabEnabled:    gitlabEnabled,
 	}
 }
 
