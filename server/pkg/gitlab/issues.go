@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 )
 
 // CreateIssueInput is the body for POST /projects/:id/issues. Only fields
@@ -26,6 +27,57 @@ func (c *Client) CreateIssue(ctx context.Context, token string, projectID int64,
 	var out Issue
 	path := fmt.Sprintf("/projects/%d/issues", projectID)
 	if err := c.do(ctx, "POST", token, path, input, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// UpdateIssueInput mirrors GitLab's PUT /projects/:id/issues/:iid body.
+// All fields are optional: omitted (nil / empty) means "do not touch".
+//
+// Labels use GitLab's additive/subtractive flags (add_labels / remove_labels)
+// rather than the full-replacement "labels" field, so non-scoped labels the
+// user has attached directly in GitLab survive a Multica-originated update.
+type UpdateIssueInput struct {
+	Title        *string
+	Description  *string
+	AddLabels    []string
+	RemoveLabels []string
+	AssigneeIDs  *[]int64
+	DueDate      *string
+	StateEvent   *string
+}
+
+// UpdateIssue sends PUT /api/v4/projects/:id/issues/:iid. Comma-joins label
+// slices so GitLab accepts them (the API expects comma-separated strings for
+// add_labels / remove_labels, not arrays).
+func (c *Client) UpdateIssue(ctx context.Context, token string, projectID int64, iid int, in UpdateIssueInput) (*Issue, error) {
+	payload := map[string]any{}
+	if in.Title != nil {
+		payload["title"] = *in.Title
+	}
+	if in.Description != nil {
+		payload["description"] = *in.Description
+	}
+	if len(in.AddLabels) > 0 {
+		payload["add_labels"] = strings.Join(in.AddLabels, ",")
+	}
+	if len(in.RemoveLabels) > 0 {
+		payload["remove_labels"] = strings.Join(in.RemoveLabels, ",")
+	}
+	if in.AssigneeIDs != nil {
+		payload["assignee_ids"] = *in.AssigneeIDs
+	}
+	if in.DueDate != nil {
+		payload["due_date"] = *in.DueDate
+	}
+	if in.StateEvent != nil {
+		payload["state_event"] = *in.StateEvent
+	}
+
+	var out Issue
+	path := fmt.Sprintf("/projects/%d/issues/%d", projectID, iid)
+	if err := c.do(ctx, "PUT", token, path, payload, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
