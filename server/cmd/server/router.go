@@ -87,13 +87,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 	h.SetBaseCtx(serverCtx)
 	h.SetPublicURL(publicURL)
 	if gitlabEnabled {
-		decrypter := gitlabsync.TokenDecrypter(func(ctx context.Context, encrypted []byte) (string, error) {
-			plain, err := secretsCipher.Decrypt(encrypted)
-			if err != nil {
-				return "", err
-			}
-			return string(plain), nil
-		})
+		decrypter := gitlabsync.NewCipherDecrypter(secretsCipher)
 		h.SetGitlabResolver(gitlabsync.NewResolver(queries, decrypter))
 	}
 

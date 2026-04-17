@@ -133,13 +133,7 @@ func main() {
 		go webhookWorker.Run(serverCtx)
 
 		// Shared decrypter for the reconciler.
-		decrypter := gitlabsync.TokenDecrypter(func(ctx context.Context, encrypted []byte) (string, error) {
-			plain, err := secretsCipher.Decrypt(encrypted)
-			if err != nil {
-				return "", err
-			}
-			return string(plain), nil
-		})
+		decrypter := gitlabsync.NewCipherDecrypter(secretsCipher)
 
 		// Reconciler — 5-minute drift catcher.
 		reconciler := gitlabsync.NewReconciler(glQueries, gitlabClient, decrypter)
