@@ -103,8 +103,12 @@ func main() {
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
 
-	var resolver *gitlabsync.Resolver
-	r := NewRouter(pool, hub, bus, secretsCipher, gitlabClient, gitlabEnabled, serverCtx, publicURL, resolver)
+	// NewRouter constructs the GitLab resolver internally when gitlabEnabled
+	// is true, so the handler has a live resolver reference by the time routes
+	// are registered. (Previously the resolver was declared here as nil and
+	// only assigned after NewRouter returned, which made the write-through
+	// guard always false in production.)
+	r := NewRouter(pool, hub, bus, secretsCipher, gitlabClient, gitlabEnabled, serverCtx, publicURL)
 
 	srv := &http.Server{
 		Addr:    ":" + port,
@@ -128,7 +132,7 @@ func main() {
 		webhookWorker := gitlabsync.NewWebhookWorker(glQueries, pool, 5, 250*time.Millisecond)
 		go webhookWorker.Run(serverCtx)
 
-		// Shared decrypter — used by both the reconciler and the resolver.
+		// Shared decrypter for the reconciler.
 		decrypter := gitlabsync.TokenDecrypter(func(ctx context.Context, encrypted []byte) (string, error) {
 			plain, err := secretsCipher.Decrypt(encrypted)
 			if err != nil {
@@ -140,9 +144,6 @@ func main() {
 		// Reconciler — 5-minute drift catcher.
 		reconciler := gitlabsync.NewReconciler(glQueries, gitlabClient, decrypter)
 		go reconciler.Run(serverCtx)
-
-		// Resolver — used by write-path handlers to pick user vs service PAT.
-		resolver = gitlabsync.NewResolver(glQueries, decrypter)
 	}
 
 	// Graceful shutdown

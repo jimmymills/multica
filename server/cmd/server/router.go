@@ -60,7 +60,13 @@ func allowedOrigins() []string {
 // workers (e.g. the gitlab initial-sync goroutine) inherit it so they stop cleanly.
 // publicURL is the externally-reachable base URL used to register gitlab webhooks;
 // empty string disables webhook registration.
-func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCipher *secrets.Cipher, gitlabClient *gitlab.Client, gitlabEnabled bool, serverCtx context.Context, publicURL string, gitlabResolver *gitlabsync.Resolver) chi.Router {
+//
+// The GitLab write-path resolver is constructed inside this function when
+// gitlabEnabled is true, so every route registered below sees a non-nil
+// resolver on the handler. Previously the resolver was passed in from main.go
+// and could be nil at the time SetGitlabResolver ran; the write-through guard
+// then silently fell back to the legacy direct-DB path in production.
+func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCipher *secrets.Cipher, gitlabClient *gitlab.Client, gitlabEnabled bool, serverCtx context.Context, publicURL string) chi.Router {
 	queries := db.New(pool)
 	emailSvc := service.NewEmailService()
 
@@ -80,7 +86,16 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, secretsCipher, gitlabClient, gitlabEnabled)
 	h.SetBaseCtx(serverCtx)
 	h.SetPublicURL(publicURL)
-	h.SetGitlabResolver(gitlabResolver)
+	if gitlabEnabled {
+		decrypter := gitlabsync.TokenDecrypter(func(ctx context.Context, encrypted []byte) (string, error) {
+			plain, err := secretsCipher.Decrypt(encrypted)
+			if err != nil {
+				return "", err
+			}
+			return string(plain), nil
+		})
+		h.SetGitlabResolver(gitlabsync.NewResolver(queries, decrypter))
+	}
 
 	r := chi.NewRouter()
 
