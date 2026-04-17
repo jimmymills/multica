@@ -172,8 +172,11 @@ type emojiHookPayload struct {
 		ID            int64  `json:"id"`
 		Name          string `json:"name"`
 		AwardableType string `json:"awardable_type"`
-		AwardableIID  int    `json:"awardable_id"`
-		UpdatedAt     string `json:"updated_at"`
+		// GitLab payload field is `awardable_id` which is the GLOBAL issue
+		// id (not the per-project IID). We look up the cached issue via
+		// GetIssueByGitlabID, not GetIssueByGitlabIID.
+		AwardableID int64  `json:"awardable_id"`
+		UpdatedAt   string `json:"updated_at"`
 	} `json:"object_attributes"`
 	User struct {
 		ID int64 `json:"id"`
@@ -190,12 +193,12 @@ func ApplyEmojiHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 	if p.ObjectAttributes.AwardableType != "Issue" {
 		return nil
 	}
-	parent, err := deps.Queries.GetIssueByGitlabIID(ctx, db.GetIssueByGitlabIIDParams{
-		WorkspaceID: deps.WorkspaceID,
-		GitlabIid:   pgtype.Int4{Int32: int32(p.ObjectAttributes.AwardableIID), Valid: true},
+	parent, err := deps.Queries.GetIssueByGitlabID(ctx, db.GetIssueByGitlabIDParams{
+		WorkspaceID:   deps.WorkspaceID,
+		GitlabIssueID: pgtype.Int8{Int64: p.ObjectAttributes.AwardableID, Valid: true},
 	})
 	if err != nil {
-		return fmt.Errorf("parent issue not yet cached (iid=%d): %w", p.ObjectAttributes.AwardableIID, err)
+		return fmt.Errorf("parent issue not yet cached (gitlab_id=%d): %w", p.ObjectAttributes.AwardableID, err)
 	}
 	var glUser pgtype.Int8
 	if p.User.ID != 0 {

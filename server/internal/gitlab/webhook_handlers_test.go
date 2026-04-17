@@ -165,14 +165,21 @@ func TestApplyEmojiHookEvent_UpsertsReaction(t *testing.T) {
 	wsUUID := mustPGUUID(t, wsID)
 	queries := db.New(pool)
 
-	row, _ := queries.UpsertIssueFromGitlab(context.Background(), db.UpsertIssueFromGitlabParams{
+	// Seed an issue with iid=42 BUT global gitlab_issue_id=1001 (different
+	// from iid). The emoji event's awardable_id will be 1001 (the global id),
+	// proving the handler uses the global-id lookup path.
+	row, err := queries.UpsertIssueFromGitlab(context.Background(), db.UpsertIssueFromGitlabParams{
 		WorkspaceID:     wsUUID,
 		GitlabIid:       pgtype.Int4{Int32: 42, Valid: true},
 		GitlabProjectID: pgtype.Int8{Int64: 7, Valid: true},
+		GitlabIssueID:   pgtype.Int8{Int64: 1001, Valid: true},
 		Title:           "Parent",
 		Status:          "todo",
 		Priority:        "none",
 	})
+	if err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
 
 	deps := WebhookDeps{Queries: queries, WorkspaceID: wsUUID, ProjectID: 7}
 
@@ -182,7 +189,7 @@ func TestApplyEmojiHookEvent_UpsertsReaction(t *testing.T) {
 			"id": 500,
 			"name": "thumbsup",
 			"awardable_type": "Issue",
-			"awardable_id": 42,
+			"awardable_id": 1001,
 			"updated_at": "2026-04-17T12:00:00Z"
 		},
 		"user": {"id": 555}
