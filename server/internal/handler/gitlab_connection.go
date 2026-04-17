@@ -147,14 +147,24 @@ func (h *Handler) ConnectGitlabWorkspace(w http.ResponseWriter, r *http.Request)
 		}
 
 		// After successful sync: register the webhook.
-		secret, err := generateWebhookSecret()
-		if err != nil {
-			slog.Error("generate webhook secret", "error", err)
-			return
-		}
 		if h.PublicURL == "" {
 			slog.Warn("MULTICA_PUBLIC_URL not configured; skipping webhook registration. Cache will go stale until reconnect.",
 				"workspace_id", wsID)
+			if err := h.Queries.UpdateWorkspaceGitlabConnectionStatus(syncCtx, db.UpdateWorkspaceGitlabConnectionStatusParams{
+				WorkspaceID:      parseUUID(wsID),
+				ConnectionStatus: "error",
+				StatusMessage: pgtype.Text{
+					String: "MULTICA_PUBLIC_URL is not configured on this server; webhooks were skipped. Reconnect after configuring it for live updates.",
+					Valid:  true,
+				},
+			}); err != nil {
+				slog.Warn("update connection status to error", "error", err)
+			}
+			return
+		}
+		secret, err := generateWebhookSecret()
+		if err != nil {
+			slog.Error("generate webhook secret", "error", err)
 			return
 		}
 		hook, err := h.Gitlab.CreateProjectHook(syncCtx, token, projectID, gitlab.CreateProjectHookInput{

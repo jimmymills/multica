@@ -76,10 +76,14 @@ func ApplyIssueHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 		return fmt.Errorf("upsert issue: %w", err)
 	}
 
-	// Note: label associations (issue_gitlab_label) are not updated here.
-	// The webhook payload includes label titles but not the gitlab_label_id,
-	// so we'd need an extra ListLabels lookup. Phase 2b's reconciler handles
-	// label associations via re-syncing labels every tick.
+	// Note: this handler doesn't update issue_gitlab_label junction rows. The
+	// webhook payload only carries label titles (not gitlab_label_ids), so we'd
+	// need an extra ListLabels round-trip to resolve. Junction rows are kept in
+	// sync by Phase 2a's initial sync (which uses ClearIssueLabels +
+	// AddIssueLabels) and by subsequent Issue Hook deliveries that include the
+	// full label set in the payload — the next Issue Hook will rewrite the
+	// associations. Phase 3 may add a label-by-name resolver here if real-time
+	// per-issue label drift becomes a UX problem.
 	return nil
 }
 

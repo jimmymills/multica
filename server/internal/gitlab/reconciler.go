@@ -128,21 +128,44 @@ func (r *Reconciler) reconcileOne(ctx context.Context, conn db.WorkspaceGitlabCo
 		}
 	}
 
-	// Stale-webhook detection.
-	if len(issues) > 0 && conn.LastWebhookReceivedAt.Valid &&
-		time.Since(conn.LastWebhookReceivedAt.Time) > r.staleWebhookWindow {
+	// Stale-webhook detection. If we've never received a webhook, treat the
+	// connection's created_at as the baseline — a connection older than the
+	// stale window without any webhooks suggests delivery is broken.
+	var lastSignal time.Time
+	if conn.LastWebhookReceivedAt.Valid {
+		lastSignal = conn.LastWebhookReceivedAt.Time
+	} else if conn.CreatedAt.Valid {
+		lastSignal = conn.CreatedAt.Time
+	}
+	if len(issues) > 0 && !lastSignal.IsZero() &&
+		time.Since(lastSignal) > r.staleWebhookWindow {
 		slog.Warn("reconciler picked up issues but webhook stream is silent",
 			"workspace_id", conn.WorkspaceID,
-			"last_webhook_received_at", conn.LastWebhookReceivedAt.Time,
+			"last_signal_at", lastSignal,
 			"reconciled_count", len(issues))
-		_ = r.queries.UpdateWorkspaceGitlabConnectionStatus(ctx, db.UpdateWorkspaceGitlabConnectionStatusParams{
+		if err := r.queries.UpdateWorkspaceGitlabConnectionStatus(ctx, db.UpdateWorkspaceGitlabConnectionStatusParams{
 			WorkspaceID:      conn.WorkspaceID,
 			ConnectionStatus: "error",
 			StatusMessage: pgtype.Text{
 				String: "webhook deliveries appear delayed; reconciler is filling the gap",
 				Valid:  true,
 			},
-		})
+		}); err != nil {
+			slog.Error("update connection status to error after stale-webhook detection", "error", err)
+		}
+	}
+
+	// Recovery: if we previously flipped to 'error' due to stale webhooks but
+	// they've started flowing again, demote back to 'connected'.
+	if conn.ConnectionStatus == "error" && conn.LastWebhookReceivedAt.Valid &&
+		time.Since(conn.LastWebhookReceivedAt.Time) <= r.staleWebhookWindow {
+		if err := r.queries.UpdateWorkspaceGitlabConnectionStatus(ctx, db.UpdateWorkspaceGitlabConnectionStatusParams{
+			WorkspaceID:      conn.WorkspaceID,
+			ConnectionStatus: "connected",
+			StatusMessage:    pgtype.Text{},
+		}); err != nil {
+			slog.Error("clear error status after webhook recovery", "error", err)
+		}
 	}
 	return nil
 }
