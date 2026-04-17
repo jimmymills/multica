@@ -2,7 +2,9 @@ package gitlab
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 )
@@ -81,6 +83,21 @@ func (c *Client) UpdateIssue(ctx context.Context, token string, projectID int64,
 		return nil, err
 	}
 	return &out, nil
+}
+
+// DeleteIssue sends DELETE /api/v4/projects/:id/issues/:iid. Treats 404 as
+// success (idempotent delete — if the issue is already gone, that's the
+// desired terminal state).
+func (c *Client) DeleteIssue(ctx context.Context, token string, projectID int64, iid int) error {
+	path := fmt.Sprintf("/projects/%d/issues/%d", projectID, iid)
+	err := c.do(ctx, http.MethodDelete, token, path, nil, nil)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	return err
 }
 
 type Issue struct {

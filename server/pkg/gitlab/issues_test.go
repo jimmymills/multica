@@ -165,6 +165,62 @@ func TestUpdateIssue_PropagatesNon2xx(t *testing.T) {
 	}
 }
 
+func TestDeleteIssue_SendsDELETE(t *testing.T) {
+	var capturedPath, capturedMethod, capturedToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedMethod = r.Method
+		capturedToken = r.Header.Get("PRIVATE-TOKEN")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, srv.Client())
+	if err := c.DeleteIssue(context.Background(), "tok", 7, 42); err != nil {
+		t.Fatalf("DeleteIssue: %v", err)
+	}
+	if capturedMethod != http.MethodDelete {
+		t.Errorf("method = %s, want DELETE", capturedMethod)
+	}
+	if capturedPath != "/api/v4/projects/7/issues/42" {
+		t.Errorf("path = %s, want /api/v4/projects/7/issues/42", capturedPath)
+	}
+	if capturedToken != "tok" {
+		t.Errorf("token header = %s, want tok", capturedToken)
+	}
+}
+
+func TestDeleteIssue_404IsSuccessIdempotent(t *testing.T) {
+	// GitLab returns 404 if the issue is already gone. For a delete, that's
+	// the desired terminal state, so we treat it as success (idempotent).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"404 Not Found"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, srv.Client())
+	if err := c.DeleteIssue(context.Background(), "tok", 7, 42); err != nil {
+		t.Fatalf("DeleteIssue: expected 404 to be treated as success, got %v", err)
+	}
+}
+
+func TestDeleteIssue_PropagatesNon2xxNon404(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, srv.Client())
+	err := c.DeleteIssue(context.Background(), "tok", 7, 42)
+	if err == nil {
+		t.Fatal("expected error on 403")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Errorf("error = %v, want to contain '403'", err)
+	}
+}
+
 func TestListIssues_UpdatedAfterPropagated(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("updated_after") != "2026-04-17T00:00:00Z" {
