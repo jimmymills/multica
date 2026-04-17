@@ -57,7 +57,9 @@ func allowedOrigins() []string {
 // NewRouter creates the fully-configured Chi router with all middleware and routes.
 // serverCtx is cancelled when the server begins shutting down; long-lived background
 // workers (e.g. the gitlab initial-sync goroutine) inherit it so they stop cleanly.
-func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCipher *secrets.Cipher, gitlabClient *gitlab.Client, gitlabEnabled bool, serverCtx context.Context) chi.Router {
+// publicURL is the externally-reachable base URL used to register gitlab webhooks;
+// empty string disables webhook registration.
+func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCipher *secrets.Cipher, gitlabClient *gitlab.Client, gitlabEnabled bool, serverCtx context.Context, publicURL string) chi.Router {
 	queries := db.New(pool)
 	emailSvc := service.NewEmailService()
 
@@ -76,6 +78,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 	cfSigner := auth.NewCloudFrontSignerFromEnv()
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, secretsCipher, gitlabClient, gitlabEnabled)
 	h.SetBaseCtx(serverCtx)
+	h.SetPublicURL(publicURL)
 
 	r := chi.NewRouter()
 
@@ -130,6 +133,9 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 	r.Post("/auth/verify-code", h.VerifyCode)
 	r.Post("/auth/google", h.GoogleLogin)
 	r.Post("/auth/logout", h.Logout)
+
+	// GitLab webhook (public — auth is via X-Gitlab-Token header)
+	r.Post("/api/gitlab/webhook", h.ReceiveGitlabWebhook)
 
 	// Daemon API routes (require daemon token or valid user token)
 	r.Route("/api/daemon", func(r chi.Router) {

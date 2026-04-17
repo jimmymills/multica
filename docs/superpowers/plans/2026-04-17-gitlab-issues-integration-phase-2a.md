@@ -5,7 +5,7 @@
 **Goal:** When a workspace admin connects their GitLab project (Phase 1), kick off a one-shot initial sync that paginates all issues, notes, award emoji, labels, and project members from gitlab.com into Multica's tables. Read endpoints serve the synced cache. Write endpoints return 501 for connected workspaces. No webhooks or reconciler yet — that's Phase 2b. After 2a ships, a workspace admin can browse a snapshot of GitLab issues in Multica; they'd need to disconnect/reconnect to get fresh data.
 
 **Architecture:**
-- **Schema is additive only.** New cache columns (`gitlab_iid`, `gitlab_project_id`, `external_updated_at`) and new cache tables (`gitlab_label`, `issue_to_label`, `gitlab_project_member`, `issue_position`). No DROPs of existing columns or tables — Phase 5 cleanup handles drops once everything has migrated to the cache shape. `creator_id` is relaxed from `NOT NULL` to nullable so synced rows can omit a Multica-mapped creator until Phase 3 introduces per-user PAT mapping.
+- **Schema is additive only.** New cache columns (`gitlab_iid`, `gitlab_project_id`, `external_updated_at`) and new cache tables (`gitlab_label`, `issue_gitlab_label`, `gitlab_project_member`, `issue_position`). No DROPs of existing columns or tables — Phase 5 cleanup handles drops once everything has migrated to the cache shape. `creator_id` is relaxed from `NOT NULL` to nullable so synced rows can omit a Multica-mapped creator until Phase 3 introduces per-user PAT mapping.
 - **GitLab client expansion** adds the read methods needed for sync: pagination helper, `ListLabels`, `CreateLabel`, `ListProjectMembers`, `ListIssues`, `ListNotes`, `ListAwardEmoji`. Each follows the existing per-call-token pattern from Phase 1's `Client`.
 - **Translation layer** (`server/internal/gitlab/translator.go`) converts GitLab JSON shapes into Multica cache values. Status comes from `status::*` scoped labels; priority from `priority::*`; agent assignment from `agent::<slug>`. Native GitLab assignees are deferred to Phase 3 (no GitLab-user→Multica-member mapping until per-user PATs exist).
 - **Sync worker** runs as a goroutine spawned by the connect handler. The connect handler writes the row with `connection_status='connecting'` and returns 200 immediately; the sync goroutine populates the cache, then transitions to `'connected'` (or `'error'` with a `status_message`). Progress + completion are published as WS events.
@@ -41,7 +41,7 @@
 |---|---|
 | `server/migrations/050_gitlab_cache_schema.up.sql` | Additive: cache-ref columns on existing tables; new cache tables; relax `creator_id NOT NULL`. |
 | `server/migrations/050_gitlab_cache_schema.down.sql` | Reverse — drop new columns + new tables, restore `creator_id NOT NULL`. |
-| `server/pkg/db/queries/gitlab_cache.sql` | sqlc queries for gitlab_label, issue_to_label, gitlab_project_member CRUD + cache upserts (issues/comments/reactions by gitlab_iid/note_id/award_id). |
+| `server/pkg/db/queries/gitlab_cache.sql` | sqlc queries for gitlab_label, issue_gitlab_label, gitlab_project_member CRUD + cache upserts (issues/comments/reactions by gitlab_iid/note_id/award_id). |
 | `server/pkg/gitlab/pagination.go` | `iteratePages` helper that follows GitLab's `Link: next` header. |
 | `server/pkg/gitlab/pagination_test.go` | Tests for pagination helper. |
 | `server/pkg/gitlab/labels.go` | `ListLabels`, `CreateLabel`. |
@@ -150,9 +150,9 @@ CREATE TABLE IF NOT EXISTS gitlab_label (
 
 CREATE INDEX idx_gitlab_label_name ON gitlab_label(workspace_id, name);
 
--- Issue ↔ label association (replaces the legacy issue_to_labels table once
+-- Issue ↔ label association (replaces the legacy issue_gitlab_labels table once
 -- Phase 5 drops it; both coexist during 2a–4).
-CREATE TABLE IF NOT EXISTS issue_to_label (
+CREATE TABLE IF NOT EXISTS issue_gitlab_label (
     issue_id UUID NOT NULL REFERENCES issue(id) ON DELETE CASCADE,
     workspace_id UUID NOT NULL,
     gitlab_label_id BIGINT NOT NULL,
@@ -161,8 +161,8 @@ CREATE TABLE IF NOT EXISTS issue_to_label (
         REFERENCES gitlab_label(workspace_id, gitlab_label_id) ON DELETE CASCADE
 );
 
-CREATE INDEX idx_issue_to_label_label
-    ON issue_to_label(workspace_id, gitlab_label_id);
+CREATE INDEX idx_issue_gitlab_label_label
+    ON issue_gitlab_label(workspace_id, gitlab_label_id);
 
 -- Cache of GitLab project members for assignee picker / avatar rendering.
 CREATE TABLE IF NOT EXISTS gitlab_project_member (
@@ -193,7 +193,7 @@ CREATE TABLE IF NOT EXISTS issue_position (
 
 DROP TABLE IF EXISTS issue_position;
 DROP TABLE IF EXISTS gitlab_project_member;
-DROP TABLE IF EXISTS issue_to_label;
+DROP TABLE IF EXISTS issue_gitlab_label;
 DROP TABLE IF EXISTS gitlab_label;
 
 ALTER TABLE attachment DROP COLUMN IF EXISTS gitlab_upload_url;
@@ -230,7 +230,7 @@ Expected: applies without error.
 
 Verify the schema using `psql` (connect via the worktree's `DATABASE_URL` from `.env.worktree`):
 ```bash
-psql "$DATABASE_URL" -c "\d issue" -c "\d gitlab_label" -c "\d issue_to_label" -c "\d gitlab_project_member" -c "\d issue_position"
+psql "$DATABASE_URL" -c "\d issue" -c "\d gitlab_label" -c "\d issue_gitlab_label" -c "\d gitlab_project_member" -c "\d issue_position"
 ```
 Expected:
 - `issue` has new columns `gitlab_iid`, `gitlab_project_id`, `external_updated_at`; `creator_id` is now nullable.
@@ -288,20 +288,20 @@ WHERE workspace_id = $1 AND name = $2;
 -- name: DeleteWorkspaceGitlabLabels :exec
 DELETE FROM gitlab_label WHERE workspace_id = $1;
 
--- issue_to_label ----------------------------------------------------------
+-- issue_gitlab_label ----------------------------------------------------------
 
 -- name: ClearIssueLabels :exec
-DELETE FROM issue_to_label WHERE issue_id = $1;
+DELETE FROM issue_gitlab_label WHERE issue_id = $1;
 
 -- name: AddIssueLabels :exec
-INSERT INTO issue_to_label (issue_id, workspace_id, gitlab_label_id)
+INSERT INTO issue_gitlab_label (issue_id, workspace_id, gitlab_label_id)
 SELECT $1, $2, unnest(sqlc.arg(label_ids)::bigint[])
 ON CONFLICT DO NOTHING;
 
 -- name: ListIssueLabels :many
 SELECT l.*
 FROM gitlab_label l
-JOIN issue_to_label il ON il.workspace_id = l.workspace_id
+JOIN issue_gitlab_label il ON il.workspace_id = l.workspace_id
                       AND il.gitlab_label_id = l.gitlab_label_id
 WHERE il.issue_id = $1
 ORDER BY l.name;
@@ -369,18 +369,21 @@ DELETE FROM issue WHERE workspace_id = $1 AND gitlab_iid IS NOT NULL;
 -- comment cache upserts ----------------------------------------------------
 
 -- name: UpsertCommentFromGitlab :one
+-- NOTE: comment.body in the original spec is actually comment.content.
+-- workspace_id is NOT NULL on comment, so it must be supplied.
 INSERT INTO comment (
+    workspace_id,
     issue_id,
     author_type,
     author_id,
-    body,
+    content,
     type,
     gitlab_note_id,
     external_updated_at
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (gitlab_note_id) WHERE gitlab_note_id IS NOT NULL DO UPDATE SET
-    body = EXCLUDED.body,
+    content = EXCLUDED.content,
     type = EXCLUDED.type,
     external_updated_at = EXCLUDED.external_updated_at,
     updated_at = now()
@@ -389,15 +392,18 @@ RETURNING *;
 -- issue_reaction cache upserts --------------------------------------------
 
 -- name: UpsertIssueReactionFromGitlab :one
+-- NOTE: issue_reaction columns in the original spec are user_id/user_type,
+-- but the actual schema uses actor_id/actor_type. workspace_id is NOT NULL.
 INSERT INTO issue_reaction (
+    workspace_id,
     issue_id,
-    user_id,
-    user_type,
+    actor_id,
+    actor_type,
     emoji,
     gitlab_award_id,
     external_updated_at
 )
-VALUES ($1, $2, $3, $4, $5, $6)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (gitlab_award_id) WHERE gitlab_award_id IS NOT NULL DO UPDATE SET
     emoji = EXCLUDED.emoji,
     external_updated_at = EXCLUDED.external_updated_at
@@ -2212,7 +2218,7 @@ func syncAllIssues(ctx context.Context, deps SyncDeps, in RunInitialSyncInput, w
 		return fmt.Errorf("agent map: %w", err)
 	}
 
-	// Build the gitlab_label_id by name lookup so we can set issue_to_label
+	// Build the gitlab_label_id by name lookup so we can set issue_gitlab_label
 	// associations from the issue's label-name list.
 	labels, err := deps.Queries.ListGitlabLabels(ctx, wsUUID)
 	if err != nil {
@@ -2304,10 +2310,11 @@ func syncOneIssue(
 			}
 		}
 		if _, err := deps.Queries.UpsertCommentFromGitlab(ctx, db.UpsertCommentFromGitlabParams{
+			WorkspaceID:       wsUUID,
 			IssueID:           row.ID,
 			AuthorType:        authorType,
 			AuthorID:          authorID,
-			Body:              nv.Body,
+			Content:           nv.Body, // comment.body in plan was actually comment.content
 			Type:              nv.Type,
 			GitlabNoteID:      pgtype.Int8{Int64: n.ID, Valid: true},
 			ExternalUpdatedAt: parseTS(nv.UpdatedAt),
@@ -2323,11 +2330,12 @@ func syncOneIssue(
 	}
 	for _, a := range awards {
 		av := TranslateAward(a)
-		// Phase 2a: leave user_id NULL for native gitlab users (Phase 3 maps).
+		// Phase 2a: leave actor_id NULL for native gitlab users (Phase 3 maps).
 		if _, err := deps.Queries.UpsertIssueReactionFromGitlab(ctx, db.UpsertIssueReactionFromGitlabParams{
+			WorkspaceID:       wsUUID,
 			IssueID:           row.ID,
-			UserID:            pgtype.UUID{},
-			UserType:          pgtype.Text{},
+			ActorID:           pgtype.UUID{}, // issue_reaction columns are actor_id/actor_type, not user_id/user_type
+			ActorType:         pgtype.Text{},
 			Emoji:             av.Emoji,
 			GitlabAwardID:     pgtype.Int8{Int64: a.ID, Valid: true},
 			ExternalUpdatedAt: parseTS(av.UpdatedAt),
@@ -2809,8 +2817,8 @@ git commit -m "feat(handler): connect dispatches initial sync goroutine; status=
 
 When a workspace disconnects GitLab, the cache becomes garbage. Phase 2a removes:
 - All `issue` rows for that workspace where `gitlab_iid IS NOT NULL` (the synced ones).
-- Cascades remove `issue_to_label`, `comment`, `issue_reaction`, `attachment` for those issues via existing FKs.
-- All `gitlab_label` rows for that workspace (the FK from `issue_to_label` already cascaded above, so the label rows can go now too).
+- Cascades remove `issue_gitlab_label`, `comment`, `issue_reaction`, `attachment` for those issues via existing FKs.
+- All `gitlab_label` rows for that workspace (the FK from `issue_gitlab_label` already cascaded above, so the label rows can go now too).
 - All `gitlab_project_member` rows.
 - The `workspace_gitlab_connection` row itself (already done by Phase 1's handler).
 
@@ -2823,7 +2831,7 @@ The three deletion queries we need already exist from Task 2:
 - `DeleteWorkspaceGitlabLabels` — `DELETE FROM gitlab_label WHERE workspace_id = $1`
 - `DeleteWorkspaceGitlabMembers` — `DELETE FROM gitlab_project_member WHERE workspace_id = $1`
 
-The handler will call all three in sequence inside a transaction. (`comment`, `issue_reaction`, `issue_to_label`, `attachment` rows cascade automatically via the FK `ON DELETE CASCADE` from `issue.id`.)
+The handler will call all three in sequence inside a transaction. (`comment`, `issue_reaction`, `issue_gitlab_label`, `attachment` rows cascade automatically via the FK `ON DELETE CASCADE` from `issue.id`.)
 
 - [ ] **Step 15.2: Modify `DisconnectGitlabWorkspace`**
 

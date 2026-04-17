@@ -56,3 +56,21 @@ DELETE FROM workspace_gitlab_connection
 WHERE workspace_id = $1
   AND connection_status = 'connecting'
   AND updated_at < now() - interval '10 minutes';
+
+-- name: ListConnectedGitlabWorkspaces :many
+SELECT * FROM workspace_gitlab_connection
+WHERE connection_status IN ('connected', 'error')
+ORDER BY workspace_id;
+
+-- name: UpdateWorkspaceGitlabSyncCursor :exec
+UPDATE workspace_gitlab_connection
+SET last_sync_cursor = $2,
+    updated_at = now()
+WHERE workspace_id = $1;
+
+-- name: UpdateWorkspaceGitlabWebhook :exec
+UPDATE workspace_gitlab_connection
+SET webhook_secret    = $2,
+    webhook_gitlab_id = $3,
+    updated_at        = now()
+WHERE workspace_id = $1;

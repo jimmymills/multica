@@ -21,7 +21,7 @@ INSERT INTO workspace_gitlab_connection (
     connection_status
 )
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING workspace_id, gitlab_project_id, gitlab_project_path, service_token_encrypted, service_token_user_id, webhook_secret, webhook_gitlab_id, last_sync_cursor, connection_status, status_message, created_at, updated_at
+RETURNING workspace_id, gitlab_project_id, gitlab_project_path, service_token_encrypted, service_token_user_id, webhook_secret, webhook_gitlab_id, last_sync_cursor, connection_status, status_message, created_at, updated_at, last_webhook_received_at
 `
 
 type CreateWorkspaceGitlabConnectionParams struct {
@@ -56,6 +56,7 @@ func (q *Queries) CreateWorkspaceGitlabConnection(ctx context.Context, arg Creat
 		&i.StatusMessage,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastWebhookReceivedAt,
 	)
 	return i, err
 }
@@ -125,7 +126,7 @@ func (q *Queries) GetUserGitlabConnection(ctx context.Context, arg GetUserGitlab
 }
 
 const getWorkspaceGitlabConnection = `-- name: GetWorkspaceGitlabConnection :one
-SELECT workspace_id, gitlab_project_id, gitlab_project_path, service_token_encrypted, service_token_user_id, webhook_secret, webhook_gitlab_id, last_sync_cursor, connection_status, status_message, created_at, updated_at FROM workspace_gitlab_connection
+SELECT workspace_id, gitlab_project_id, gitlab_project_path, service_token_encrypted, service_token_user_id, webhook_secret, webhook_gitlab_id, last_sync_cursor, connection_status, status_message, created_at, updated_at, last_webhook_received_at FROM workspace_gitlab_connection
 WHERE workspace_id = $1
 `
 
@@ -145,8 +146,49 @@ func (q *Queries) GetWorkspaceGitlabConnection(ctx context.Context, workspaceID 
 		&i.StatusMessage,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LastWebhookReceivedAt,
 	)
 	return i, err
+}
+
+const listConnectedGitlabWorkspaces = `-- name: ListConnectedGitlabWorkspaces :many
+SELECT workspace_id, gitlab_project_id, gitlab_project_path, service_token_encrypted, service_token_user_id, webhook_secret, webhook_gitlab_id, last_sync_cursor, connection_status, status_message, created_at, updated_at, last_webhook_received_at FROM workspace_gitlab_connection
+WHERE connection_status IN ('connected', 'error')
+ORDER BY workspace_id
+`
+
+func (q *Queries) ListConnectedGitlabWorkspaces(ctx context.Context) ([]WorkspaceGitlabConnection, error) {
+	rows, err := q.db.Query(ctx, listConnectedGitlabWorkspaces)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkspaceGitlabConnection{}
+	for rows.Next() {
+		var i WorkspaceGitlabConnection
+		if err := rows.Scan(
+			&i.WorkspaceID,
+			&i.GitlabProjectID,
+			&i.GitlabProjectPath,
+			&i.ServiceTokenEncrypted,
+			&i.ServiceTokenUserID,
+			&i.WebhookSecret,
+			&i.WebhookGitlabID,
+			&i.LastSyncCursor,
+			&i.ConnectionStatus,
+			&i.StatusMessage,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastWebhookReceivedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const updateWorkspaceGitlabConnectionStatus = `-- name: UpdateWorkspaceGitlabConnectionStatus :exec
@@ -165,6 +207,42 @@ type UpdateWorkspaceGitlabConnectionStatusParams struct {
 
 func (q *Queries) UpdateWorkspaceGitlabConnectionStatus(ctx context.Context, arg UpdateWorkspaceGitlabConnectionStatusParams) error {
 	_, err := q.db.Exec(ctx, updateWorkspaceGitlabConnectionStatus, arg.WorkspaceID, arg.ConnectionStatus, arg.StatusMessage)
+	return err
+}
+
+const updateWorkspaceGitlabSyncCursor = `-- name: UpdateWorkspaceGitlabSyncCursor :exec
+UPDATE workspace_gitlab_connection
+SET last_sync_cursor = $2,
+    updated_at = now()
+WHERE workspace_id = $1
+`
+
+type UpdateWorkspaceGitlabSyncCursorParams struct {
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	LastSyncCursor pgtype.Timestamptz `json:"last_sync_cursor"`
+}
+
+func (q *Queries) UpdateWorkspaceGitlabSyncCursor(ctx context.Context, arg UpdateWorkspaceGitlabSyncCursorParams) error {
+	_, err := q.db.Exec(ctx, updateWorkspaceGitlabSyncCursor, arg.WorkspaceID, arg.LastSyncCursor)
+	return err
+}
+
+const updateWorkspaceGitlabWebhook = `-- name: UpdateWorkspaceGitlabWebhook :exec
+UPDATE workspace_gitlab_connection
+SET webhook_secret    = $2,
+    webhook_gitlab_id = $3,
+    updated_at        = now()
+WHERE workspace_id = $1
+`
+
+type UpdateWorkspaceGitlabWebhookParams struct {
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	WebhookSecret   pgtype.Text `json:"webhook_secret"`
+	WebhookGitlabID pgtype.Int8 `json:"webhook_gitlab_id"`
+}
+
+func (q *Queries) UpdateWorkspaceGitlabWebhook(ctx context.Context, arg UpdateWorkspaceGitlabWebhookParams) error {
+	_, err := q.db.Exec(ctx, updateWorkspaceGitlabWebhook, arg.WorkspaceID, arg.WebhookSecret, arg.WebhookGitlabID)
 	return err
 }
 
