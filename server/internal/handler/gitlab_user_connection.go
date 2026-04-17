@@ -42,6 +42,20 @@ func (h *Handler) ConnectUserGitlab(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A personal PAT is meaningless unless the workspace itself is connected to
+	// GitLab — the write-through resolver short-circuits on no workspace
+	// connection and would never read it. Reject early so we don't encrypt and
+	// store dead weight (or needlessly hit /user with a token we'd discard).
+	if _, err := h.Queries.GetWorkspaceGitlabConnection(r.Context(), parseUUID(workspaceID)); err != nil {
+		if isNotFound(err) {
+			writeError(w, http.StatusConflict, "workspace is not connected to GitLab")
+			return
+		}
+		slog.Error("read workspace_gitlab_connection", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to read workspace connection")
+		return
+	}
+
 	var req connectUserGitlabRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")

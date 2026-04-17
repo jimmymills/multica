@@ -6,10 +6,36 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+// seedWorkspaceGitlabConnection inserts a minimal workspace_gitlab_connection
+// row so that handlers gated on "workspace is GitLab-connected" can run. Most
+// per-user PAT tests don't care about the service-level connection details, so
+// we keep the fixture small and register cleanup via t.Cleanup.
+func seedWorkspaceGitlabConnection(t *testing.T, h *Handler) {
+	t.Helper()
+	ctx := context.Background()
+	if err := h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("clean workspace_gitlab_connection: %v", err)
+	}
+	if _, err := h.Queries.CreateWorkspaceGitlabConnection(ctx, db.CreateWorkspaceGitlabConnectionParams{
+		WorkspaceID:           parseUUID(testWorkspaceID),
+		GitlabProjectID:       42,
+		GitlabProjectPath:     "team/app",
+		ServiceTokenEncrypted: []byte("x"),
+		ServiceTokenUserID:    1,
+		ConnectionStatus:      "connected",
+	}); err != nil {
+		t.Fatalf("seed workspace_gitlab_connection: %v", err)
+	}
+	t.Cleanup(func() {
+		h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	})
+}
 
 func TestConnectUserGitlab_Success(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -22,6 +48,7 @@ func TestConnectUserGitlab_Success(t *testing.T) {
 	defer fake.Close()
 
 	h := buildHandlerWithGitlab(t, fake.URL)
+	seedWorkspaceGitlabConnection(t, h)
 	defer h.Queries.DeleteUserGitlabConnection(context.Background(), db.DeleteUserGitlabConnectionParams{
 		UserID:      parseUUID(testUserID),
 		WorkspaceID: parseUUID(testWorkspaceID),
@@ -56,6 +83,7 @@ func TestConnectUserGitlab_BadToken(t *testing.T) {
 	defer fake.Close()
 
 	h := buildHandlerWithGitlab(t, fake.URL)
+	seedWorkspaceGitlabConnection(t, h)
 
 	body, _ := json.Marshal(map[string]string{"token": "bad"})
 	req := httptest.NewRequest(http.MethodPost, "/api/me/gitlab/connect", bytes.NewReader(body))
@@ -77,6 +105,7 @@ func TestGetUserGitlabConnection_Connected(t *testing.T) {
 	defer fake.Close()
 
 	h := buildHandlerWithGitlab(t, fake.URL)
+	seedWorkspaceGitlabConnection(t, h)
 	defer h.Queries.DeleteUserGitlabConnection(context.Background(), db.DeleteUserGitlabConnectionParams{
 		UserID:      parseUUID(testUserID),
 		WorkspaceID: parseUUID(testWorkspaceID),
@@ -131,6 +160,60 @@ func TestGetUserGitlabConnection_NotConnected(t *testing.T) {
 	}
 }
 
+// M1: registering a personal PAT on a workspace that isn't connected to GitLab
+// must be rejected. Otherwise the PAT gets encrypted and stored as dead weight
+// (the write-through resolver short-circuits on no workspace connection).
+func TestConnectUserGitlab_RejectsWhenWorkspaceNotConnected(t *testing.T) {
+	var calls atomic.Int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id": 999, "username": "alice"}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	// Make sure no workspace_gitlab_connection row exists for this workspace.
+	if err := h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID)); err != nil {
+		t.Fatalf("clean workspace_gitlab_connection: %v", err)
+	}
+	// Defensive: ensure no stale user row either, and clean up after.
+	h.Queries.DeleteUserGitlabConnection(context.Background(), db.DeleteUserGitlabConnectionParams{
+		UserID:      parseUUID(testUserID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	t.Cleanup(func() {
+		h.Queries.DeleteUserGitlabConnection(context.Background(), db.DeleteUserGitlabConnectionParams{
+			UserID:      parseUUID(testUserID),
+			WorkspaceID: parseUUID(testWorkspaceID),
+		})
+	})
+
+	body, _ := json.Marshal(map[string]string{"token": "glpat-user-abc"})
+	req := httptest.NewRequest(http.MethodPost, "/api/me/gitlab/connect", bytes.NewReader(body))
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	rr := httptest.NewRecorder()
+
+	h.ConnectUserGitlab(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", rr.Code, rr.Body.String())
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("fake GitLab was called %d times; want 0 (token validation must short-circuit before calling /user)", n)
+	}
+
+	// Must not have persisted a user_gitlab_connection row.
+	_, err := h.Queries.GetUserGitlabConnection(context.Background(), db.GetUserGitlabConnectionParams{
+		UserID:      parseUUID(testUserID),
+		WorkspaceID: parseUUID(testWorkspaceID),
+	})
+	if err == nil {
+		t.Errorf("user_gitlab_connection row was inserted despite 409 response")
+	}
+}
+
 func TestDisconnectUserGitlab_Success(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -139,6 +222,7 @@ func TestDisconnectUserGitlab_Success(t *testing.T) {
 	defer fake.Close()
 
 	h := buildHandlerWithGitlab(t, fake.URL)
+	seedWorkspaceGitlabConnection(t, h)
 	body, _ := json.Marshal(map[string]string{"token": "glpat-x"})
 	connReq := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
 	connReq.Header.Set("X-User-ID", testUserID)
