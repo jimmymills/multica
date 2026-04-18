@@ -149,24 +149,33 @@ type BatchFailed struct {
 
 // classifyBatchError maps a GitLab-or-handler error to a stable error_code
 // string for the BatchFailed response. Stability matters — clients key
-// retry logic off these codes.
+// retry logic off these codes. Uses errors.Is / errors.As so the
+// classification is invariant under wrapping (e.g. writeThroughError's
+// "gitlab update issue failed: %w" still matches the underlying sentinel).
+// Previous implementation used strings.Contains on the formatted error
+// message, which misclassified e.g. a 500 whose body happened to include
+// the substring "404".
 func classifyBatchError(err error) (code, msg string) {
 	if err == nil {
 		return "", ""
 	}
-	m := err.Error()
-	switch {
-	case strings.Contains(m, "403"):
-		return "GITLAB_403", m
-	case strings.Contains(m, "404"):
-		return "GITLAB_404", m
-	case strings.Contains(m, "429"):
-		return "GITLAB_429", m
-	case errors.Is(err, pgx.ErrNoRows):
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "NOT_FOUND", "issue not found"
-	default:
-		return "WRITE_FAILED", m
 	}
+	if errors.Is(err, gitlabapi.ErrForbidden) {
+		return "GITLAB_403", err.Error()
+	}
+	if errors.Is(err, gitlabapi.ErrNotFound) {
+		return "GITLAB_404", err.Error()
+	}
+	if errors.Is(err, gitlabapi.ErrUnauthorized) {
+		return "GITLAB_401", err.Error()
+	}
+	var apiErr *gitlabapi.APIError
+	if errors.As(err, &apiErr) {
+		return fmt.Sprintf("GITLAB_%d", apiErr.StatusCode), err.Error()
+	}
+	return "WRITE_FAILED", err.Error()
 }
 
 // extractSnippet extracts a snippet of text around the first occurrence of query.
@@ -1212,18 +1221,35 @@ func buildUpsertParamsForUpdate(
 	values gitlabsync.IssueValues,
 	req UpdateIssueRequest,
 ) db.UpsertIssueFromGitlabParams {
-	// Start with prev values for the fields the upsert would otherwise wipe.
-	assigneeType := prevIssue.AssigneeType
-	assigneeID := prevIssue.AssigneeID
+	// Default both to zero. We'll fill them in below per the following rules:
+	//   - Agent assignment: GitLab's labels are the source of truth. If the
+	//     translator resolved an agent::<slug> label on the response, use it;
+	//     otherwise the agent assignment is considered removed (a prior agent
+	//     label was dropped, either by this PATCH or by an outside actor).
+	//   - Member assignment: cache-only in Phase 3b (translator drops it).
+	//     Preserve the prev cache value so a GitLab-originated PATCH that
+	//     only touches labels doesn't wipe the member assignee.
+	var assigneeType pgtype.Text
+	var assigneeID pgtype.UUID
 	dueDate := prevIssue.DueDate
 
-	// If the translator resolved an agent assignee from the GitLab response,
-	// that wins — the label change on GitLab is the source of truth.
-	if values.AssigneeType == "agent" {
+	switch {
+	case values.AssigneeType == "agent":
+		// Agent resolved from GitLab label — the GitLab-side state wins.
 		assigneeType = pgtype.Text{String: "agent", Valid: true}
 		var newID pgtype.UUID
 		_ = newID.Scan(values.AssigneeID)
 		assigneeID = newID
+	case prevIssue.AssigneeType.String == "member":
+		// Member assignee is cache-only (translator drops member assignees).
+		// Preserve it so non-assignee PATCHes don't wipe it. Explicit member
+		// clearing continues to flow through the narg UpdateIssue step below.
+		assigneeType = prevIssue.AssigneeType
+		assigneeID = prevIssue.AssigneeID
+	default:
+		// Prev was unassigned OR prev was an agent that's no longer on the
+		// GitLab response (agent::<slug> label removed). In both cases the
+		// desired cache state is unassigned — leave the zero values.
 	}
 
 	// If the PATCH body set a non-empty due_date, use it. (Explicit null
@@ -1290,7 +1316,12 @@ type writeThroughError struct {
 
 func (e *writeThroughError) Error() string {
 	if e.err != nil {
-		return e.msg + ": " + e.err.Error()
+		// Use %w so errors.Is / errors.As traverse the wrapped chain at
+		// higher layers (e.g. classifyBatchError matching sentinel errors
+		// through the wrapper); Unwrap() below is what actually exposes
+		// the chain, but fmt.Errorf with %w also avoids double-wrapping
+		// the formatted message.
+		return fmt.Errorf("%s: %w", e.msg, e.err).Error()
 	}
 	return e.msg
 }
@@ -1349,7 +1380,7 @@ func (h *Handler) updateSingleIssueWriteThrough(
 		AssigneeType: prevIssue.AssigneeType.String,
 		AssigneeUUID: uuidToString(prevIssue.AssigneeID),
 	}
-	glInput := gitlabsync.BuildUpdateIssueInput(oldSnap, gitlabsync.UpdateIssueRequest{
+	translatorReq := gitlabsync.UpdateIssueRequest{
 		Title:        req.Title,
 		Description:  req.Description,
 		Status:       req.Status,
@@ -1357,7 +1388,23 @@ func (h *Handler) updateSingleIssueWriteThrough(
 		AssigneeType: req.AssigneeType,
 		AssigneeID:   req.AssigneeID,
 		DueDate:      req.DueDate,
-	}, agentSlugByUUID)
+	}
+	// Explicit-null assignee clearing: a PATCH body with
+	// {"assignee_type": null, "assignee_id": null} must remove the
+	// agent::<slug> label on GitLab. The req fields arrive as nil *string
+	// (indistinguishable from "absent"), so we use rawFields to tell the
+	// difference — when the key is present but the pointer is nil, pass a
+	// pointer to the empty string so BuildUpdateIssueInput diffs to "clear".
+	if rawFields != nil {
+		empty := ""
+		if _, present := rawFields["assignee_type"]; present && req.AssigneeType == nil {
+			translatorReq.AssigneeType = &empty
+		}
+		if _, present := rawFields["assignee_id"]; present && req.AssigneeID == nil {
+			translatorReq.AssigneeID = &empty
+		}
+	}
+	glInput := gitlabsync.BuildUpdateIssueInput(oldSnap, translatorReq, agentSlugByUUID)
 
 	if !prevIssue.GitlabIid.Valid || !prevIssue.GitlabProjectID.Valid {
 		// Defensive: a cache row on a GitLab-connected workspace that

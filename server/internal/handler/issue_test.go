@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,8 +13,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	gitlabapi "github.com/multica-ai/multica/server/pkg/gitlab"
 )
 
 func TestCreateIssue_WriteThroughHumanWithoutPATUsesServicePAT(t *testing.T) {
@@ -1272,5 +1275,186 @@ func TestUpdateIssue_WriteThroughWritesDueDateWhenExplicitlySet(t *testing.T) {
 		t.Errorf("cached due_date = NULL, want 2026-05-01 (B1: req.DueDate must land in cache)")
 	} else if dueDate.UTC().Format("2006-01-02") != "2026-05-01" {
 		t.Errorf("cached due_date = %s, want 2026-05-01", dueDate.UTC().Format("2006-01-02"))
+	}
+}
+
+// TestClassifyBatchError covers the error-classification code that feeds
+// BatchWriteResult.Failed items. Uses errors.Is / errors.As so the
+// classification survives wrapping — particularly important because
+// writeThroughError wraps the underlying GitLab sentinel via fmt.Errorf
+// with %w. A prior implementation used strings.Contains on the formatted
+// message; this test pins the semantic contract.
+func TestClassifyBatchError(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{"nil", nil, ""},
+		{"pgx ErrNoRows", pgx.ErrNoRows, "NOT_FOUND"},
+		{"sentinel 403", gitlabapi.ErrForbidden, "GITLAB_403"},
+		{"sentinel 404", gitlabapi.ErrNotFound, "GITLAB_404"},
+		{"sentinel 401", gitlabapi.ErrUnauthorized, "GITLAB_401"},
+		{"APIError 429", &gitlabapi.APIError{StatusCode: 429, Message: "rate limited"}, "GITLAB_429"},
+		{"APIError 500", &gitlabapi.APIError{StatusCode: 500, Message: "oops"}, "GITLAB_500"},
+		{"generic", errors.New("other"), "WRITE_FAILED"},
+		{"wrapped 403", fmt.Errorf("context: %w", gitlabapi.ErrForbidden), "GITLAB_403"},
+		{"wrapped APIError 429", fmt.Errorf("gitlab update: %w", &gitlabapi.APIError{StatusCode: 429, Message: "rate"}), "GITLAB_429"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _ := classifyBatchError(tc.err)
+			if code != tc.wantCode {
+				t.Errorf("code = %q, want %q", code, tc.wantCode)
+			}
+		})
+	}
+}
+
+// TestUpdateIssue_WriteThroughExplicitNullAssigneeRemovesAgentLabel guards
+// I2: a PATCH of {"assignee_type": null, "assignee_id": null} on an issue
+// that currently has an agent assignee must send remove_labels: agent::<slug>
+// to GitLab (and clear the cache row). The req fields are *string so nil
+// is indistinguishable from "absent" — the handler threads rawFields into
+// the translator via an empty-string pointer to mean "cleared".
+func TestUpdateIssue_WriteThroughExplicitNullAssigneeRemovesAgentLabel(t *testing.T) {
+	ctx := context.Background()
+
+	// Look up the seeded test agent (slug: handler-test-agent).
+	var agentID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
+		testWorkspaceID, "Handler Test Agent",
+	).Scan(&agentID); err != nil {
+		t.Fatalf("look up test agent: %v", err)
+	}
+
+	var gitlabBody map[string]any
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gitlabBody)
+		w.Header().Set("Content-Type", "application/json")
+		// GitLab responds with the agent label removed — no agent::<slug> label.
+		_, _ = w.Write([]byte(`{"id":9220,"iid":220,"title":"T","state":"opened",
+			"labels":["status::todo","priority::none"],"updated_at":"2026-04-17T13:00:00Z"}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	seedGitlabWriteThroughFixture(t, h)
+	t.Cleanup(func() {
+		h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	})
+
+	// Seed the issue already assigned to the agent.
+	issueID := uuid.New().String()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue (id, workspace_id, number, title, description, status, priority,
+		 assignee_type, assignee_id,
+		 gitlab_iid, gitlab_project_id, gitlab_issue_id, external_updated_at,
+		 creator_type, creator_id, position)
+		 VALUES ($1::uuid, $2::uuid, 3010, 'T', '', 'todo', 'none',
+		         'agent', $3::uuid,
+		         220, 42, 9220, '2026-04-17T12:00:00Z',
+		         'member', $4::uuid, 0)`,
+		issueID, testWorkspaceID, agentID, testUserID); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM agent_task_queue WHERE issue_id = $1::uuid`, issueID)
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1::uuid`, issueID)
+	})
+
+	body := []byte(`{"assignee_type": null, "assignee_id": null}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/issues/"+issueID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.UpdateIssue(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// GitLab must have received remove_labels containing agent::handler-test-agent.
+	removeLabels, _ := gitlabBody["remove_labels"].(string)
+	if !strings.Contains(removeLabels, "agent::handler-test-agent") {
+		t.Errorf("remove_labels = %q, want to contain agent::handler-test-agent (I2 regression)", removeLabels)
+	}
+
+	// Cache row's assignee must be cleared. Scan into *string so NULL
+	// columns land as nil pointers.
+	var (
+		cachedType *string
+		cachedID   *string
+	)
+	if err := testPool.QueryRow(ctx,
+		`SELECT assignee_type, assignee_id::text FROM issue WHERE id = $1::uuid`,
+		issueID).Scan(&cachedType, &cachedID); err != nil {
+		t.Fatalf("scan cache: %v", err)
+	}
+	if cachedType != nil {
+		t.Errorf("cached assignee_type = %q, want NULL", *cachedType)
+	}
+	if cachedID != nil {
+		t.Errorf("cached assignee_id = %q, want NULL", *cachedID)
+	}
+}
+
+// TestDeleteIssue_WriteThrough_GitLab404IsIdempotent verifies the handler-level
+// idempotency contract that pairs with the client-level test in pkg/gitlab:
+// when GitLab returns 404 on DELETE /issues/:iid (issue already gone), the
+// Client swallows the error, so the handler should clean up the cache row
+// and return success — not 502.
+func TestDeleteIssue_WriteThrough_GitLab404IsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"404 Not Found"}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	seedGitlabWriteThroughFixture(t, h)
+	t.Cleanup(func() {
+		h.Queries.DeleteWorkspaceGitlabConnection(context.Background(), parseUUID(testWorkspaceID))
+	})
+
+	issueID := uuid.New().String()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue (id, workspace_id, number, title, description, status, priority,
+		 gitlab_iid, gitlab_project_id, gitlab_issue_id, external_updated_at,
+		 creator_type, creator_id, position)
+		 VALUES ($1::uuid, $2::uuid, 3020, 'T', '', 'todo', 'none',
+		         404, 42, 9404, '2026-04-17T12:00:00Z',
+		         'member', $3::uuid, 0)`,
+		issueID, testWorkspaceID, testUserID); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1::uuid`, issueID)
+	})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/issues/"+issueID, nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.DeleteIssue(rec, req)
+
+	if rec.Code != http.StatusNoContent && rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 204 or 200 (GitLab 404 on DELETE is idempotent), body = %s",
+			rec.Code, rec.Body.String())
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM issue WHERE id = $1::uuid`, issueID).Scan(&count); err != nil {
+		t.Fatalf("count cache: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("cache row not cleaned up on 404, count = %d", count)
 	}
 }
