@@ -275,7 +275,7 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 					r.With(gw).Post("/comments", h.CreateComment)
 					r.With(gw).Post("/subscribe", h.SubscribeToIssue)
 					r.With(gw).Post("/unsubscribe", h.UnsubscribeFromIssue)
-					r.With(gw).Post("/tasks/{taskId}/cancel", h.CancelTask)
+					r.Post("/tasks/{taskId}/cancel", h.CancelTask)
 					r.With(gw).Post("/reactions", h.AddIssueReaction)
 					r.With(gw).Delete("/reactions", h.RemoveIssueReaction)
 				})
