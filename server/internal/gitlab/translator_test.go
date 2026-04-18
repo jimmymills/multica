@@ -96,6 +96,62 @@ func TestTranslateIssue_MultipleAgentLabelsPicksFirstAlphabetically(t *testing.T
 	}
 }
 
+func TestTranslateIssue_ExtractsFirstAssigneeGitlabUserID(t *testing.T) {
+	in := gitlabapi.Issue{
+		ID:        42,
+		IID:       5,
+		Assignees: []gitlabapi.User{{ID: 7, Username: "alice"}, {ID: 8, Username: "bob"}},
+	}
+	vals := TranslateIssue(in, &TranslateContext{})
+	if vals.GitlabAssigneeUserID != 7 {
+		t.Errorf("GitlabAssigneeUserID = %d, want 7 (first assignee)", vals.GitlabAssigneeUserID)
+	}
+}
+
+func TestTranslateIssue_NoAssigneeMeansZero(t *testing.T) {
+	in := gitlabapi.Issue{ID: 42, IID: 5, Assignees: nil}
+	vals := TranslateIssue(in, &TranslateContext{})
+	if vals.GitlabAssigneeUserID != 0 {
+		t.Errorf("GitlabAssigneeUserID = %d, want 0", vals.GitlabAssigneeUserID)
+	}
+}
+
+func TestTranslateIssue_AgentLabelWinsOverNativeAssignee(t *testing.T) {
+	// Existing rule: agent::<slug> label still wins for AssigneeType selection.
+	// But GitlabAssigneeUserID is still populated for downstream reverse lookup.
+	in := gitlabapi.Issue{
+		ID: 42, IID: 5,
+		Labels:    []string{"agent::builder"},
+		Assignees: []gitlabapi.User{{ID: 7, Username: "alice"}},
+	}
+	vals := TranslateIssue(in, &TranslateContext{AgentBySlug: map[string]string{"builder": "agent-uuid"}})
+	if vals.AssigneeType != "agent" {
+		t.Errorf("AssigneeType = %q, want agent", vals.AssigneeType)
+	}
+	if vals.GitlabAssigneeUserID != 7 {
+		t.Errorf("GitlabAssigneeUserID = %d, want 7 (still extracted alongside agent label)", vals.GitlabAssigneeUserID)
+	}
+}
+
+func TestTranslateIssue_ExtractsCreatorGitlabUserID(t *testing.T) {
+	in := gitlabapi.Issue{
+		ID: 42, IID: 5,
+		Author: gitlabapi.User{ID: 99, Username: "carol"},
+	}
+	vals := TranslateIssue(in, &TranslateContext{})
+	if vals.CreatorGitlabUserID != 99 {
+		t.Errorf("CreatorGitlabUserID = %d, want 99", vals.CreatorGitlabUserID)
+	}
+}
+
+func TestTranslateIssue_NoAuthorMeansZeroCreator(t *testing.T) {
+	in := gitlabapi.Issue{ID: 42, IID: 5}
+	vals := TranslateIssue(in, &TranslateContext{})
+	if vals.CreatorGitlabUserID != 0 {
+		t.Errorf("CreatorGitlabUserID = %d, want 0", vals.CreatorGitlabUserID)
+	}
+}
+
 func TestTranslateNote_StripsAgentPrefix(t *testing.T) {
 	in := gitlabapi.Note{
 		Body:   "**[agent:builder]** I'm working on it.",

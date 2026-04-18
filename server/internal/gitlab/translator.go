@@ -29,6 +29,13 @@ type IssueValues struct {
 	AssigneeID   string // "" | UUID string
 	DueDate      string // YYYY-MM-DD or ""
 	UpdatedAt    string // RFC3339 from GitLab
+
+	// GitlabAssigneeUserID is the first native GitLab assignee's user ID (0 if
+	// none). Populated regardless of whether an agent::<slug> label is present
+	// — the caller decides which wins via Resolver reverse lookup.
+	GitlabAssigneeUserID int64
+	// CreatorGitlabUserID is the GitLab issue author's user ID (0 if absent).
+	CreatorGitlabUserID int64
 }
 
 func TranslateIssue(in gitlabapi.Issue, tc *TranslateContext) IssueValues {
@@ -44,6 +51,17 @@ func TranslateIssue(in gitlabapi.Issue, tc *TranslateContext) IssueValues {
 		Priority:    pickPriority(in.Labels),
 	}
 	out.AssigneeType, out.AssigneeID = pickAssignee(in.Labels, tc.AgentBySlug)
+
+	// Surface the first native assignee's GitLab user ID for caller-side
+	// reverse resolution. This runs regardless of whether an agent::<slug>
+	// label is present — the caller decides which wins.
+	if len(in.Assignees) > 0 {
+		out.GitlabAssigneeUserID = in.Assignees[0].ID
+	}
+
+	// Surface the author's GitLab user ID (0 when absent).
+	out.CreatorGitlabUserID = in.Author.ID
+
 	return out
 }
 
