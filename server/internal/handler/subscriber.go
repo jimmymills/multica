@@ -195,6 +195,59 @@ func (h *Handler) UnsubscribeFromIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Phase 3d write-through: when the workspace has a GitLab connection AND
+	// the target subscriber is the caller (no body override) AND the caller is
+	// a member, POST the unsubscribe to GitLab first using the caller's PAT,
+	// then remove the local cache row. Agent unsubscribes stay Multica-only —
+	// GitLab has no concept of agent subscribers. A body-override that
+	// targets a different user falls through to the legacy path, because
+	// GitLab's unsubscribe endpoint only acts on the PAT holder.
+	isSelfUnsubscribe := targetUserType == callerActorType && targetUserID == callerActorID
+	if h.GitlabEnabled && h.GitlabResolver != nil && isSelfUnsubscribe && targetUserType != "agent" {
+		_, wsErr := h.Queries.GetWorkspaceGitlabConnection(r.Context(), issue.WorkspaceID)
+		if wsErr == nil {
+			if !issue.GitlabIid.Valid || !issue.GitlabProjectID.Valid {
+				slog.Error("gitlab connected workspace but issue has no gitlab refs",
+					"issue_id", issueID, "workspace_id", workspaceID)
+				writeError(w, http.StatusBadGateway, "issue not linked to gitlab")
+				return
+			}
+
+			token, _, tokErr := h.GitlabResolver.ResolveTokenForWrite(r.Context(), workspaceID, callerActorType, callerActorID)
+			if tokErr != nil {
+				slog.Error("resolve gitlab token", "error", tokErr, "workspace_id", workspaceID)
+				writeError(w, http.StatusBadGateway, "could not resolve gitlab token")
+				return
+			}
+
+			if err := h.Gitlab.Unsubscribe(r.Context(), token,
+				issue.GitlabProjectID.Int64, int(issue.GitlabIid.Int32)); err != nil {
+				slog.Error("gitlab unsubscribe", "error", err, "issue_id", issueID)
+				writeError(w, http.StatusBadGateway, "gitlab unsubscribe failed")
+				return
+			}
+
+			if err := h.Queries.RemoveIssueSubscriber(r.Context(), db.RemoveIssueSubscriberParams{
+				IssueID:  issue.ID,
+				UserType: targetUserType,
+				UserID:   parseUUID(targetUserID),
+			}); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to unsubscribe")
+				return
+			}
+
+			h.publish(protocol.EventSubscriberRemoved, workspaceID, callerActorType, callerActorID, map[string]any{
+				"issue_id":  issueID,
+				"user_type": targetUserType,
+				"user_id":   targetUserID,
+			})
+
+			writeJSON(w, http.StatusOK, map[string]bool{"subscribed": false})
+			return
+		}
+		// wsErr != nil → fall through to legacy path (non-connected workspace).
+	}
+
 	err := h.Queries.RemoveIssueSubscriber(r.Context(), db.RemoveIssueSubscriberParams{
 		IssueID:  issue.ID,
 		UserType: targetUserType,
