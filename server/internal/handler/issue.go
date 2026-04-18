@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 	"github.com/multica-ai/multica/server/internal/logger"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	gitlabapi "github.com/multica-ai/multica/server/pkg/gitlab"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -844,6 +845,69 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce agent visibility for caller-initiated creates: private agents can
+	// only be assigned by owner/admin. Uses the HTTP user-id header to judge the
+	// caller; CreateIssueInternal (autopilot, service-side callers) skips this
+	// check — internal callers are already authorized.
+	if req.AssigneeType != nil && *req.AssigneeType == "agent" && req.AssigneeID != nil {
+		if ok, msg := h.canAssignAgent(r.Context(), r, *req.AssigneeID, workspaceID); !ok {
+			writeError(w, http.StatusForbidden, msg)
+			return
+		}
+	}
+
+	actorType, actorID := h.resolveActor(r, creatorID, workspaceID)
+
+	resp, _, err := h.CreateIssueInternal(r.Context(), workspaceID, actorType, actorID, req)
+	if err != nil {
+		var wt *writeThroughError
+		if errors.As(err, &wt) {
+			writeError(w, writeThroughStatus(wt), wt.Error())
+			return
+		}
+		if errors.Is(err, errCreateIssueInvalidParent) {
+			writeError(w, http.StatusBadRequest, "parent issue not found in this workspace")
+			return
+		}
+		if errors.Is(err, errCreateIssueInvalidDueDate) {
+			writeError(w, http.StatusBadRequest, "invalid due_date format, expected RFC3339")
+			return
+		}
+		slog.Warn("create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
+		writeError(w, http.StatusInternalServerError, "failed to create issue: "+err.Error())
+		return
+	}
+
+	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", resp.ID, "title", resp.Title, "status", resp.Status, "workspace_id", workspaceID)...)
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+// Sentinel errors for CreateIssueInternal request-validation failures. HTTP
+// callers map these to 400 responses; non-HTTP callers (autopilot) propagate
+// them as-is.
+var (
+	errCreateIssueInvalidParent  = errors.New("parent issue not found in this workspace")
+	errCreateIssueInvalidDueDate = errors.New("invalid due_date format, expected RFC3339")
+)
+
+// CreateIssueInternal is the HTTP-agnostic core of issue creation. It runs the
+// same write-through path as the HTTP handler: when the workspace has a GitLab
+// connection, create the issue in GitLab first and reconcile the cache from
+// the returned representation; otherwise fall back to the direct-DB path.
+//
+// Callers (the HTTP handler and service-side callers such as the autopilot
+// service) own:
+//   - authZ / visibility checks BEFORE calling this method
+//   - error classification for their transport (HTTP status, log shape)
+//
+// Returns (response, cache row, error). The cache row lets non-HTTP callers
+// (e.g. autopilot) record follow-up mappings (autopilot_issue) without a
+// second DB round-trip.
+func (h *Handler) CreateIssueInternal(
+	ctx context.Context,
+	workspaceID, actorType, actorID string,
+	req CreateIssueRequest,
+) (*IssueResponse, db.Issue, error) {
 	status := req.Status
 	if status == "" {
 		status = "todo"
@@ -862,14 +926,6 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		assigneeID = parseUUID(*req.AssigneeID)
 	}
 
-	// Enforce agent visibility: private agents can only be assigned by owner/admin.
-	if req.AssigneeType != nil && *req.AssigneeType == "agent" && req.AssigneeID != nil {
-		if ok, msg := h.canAssignAgent(r.Context(), r, *req.AssigneeID, workspaceID); !ok {
-			writeError(w, http.StatusForbidden, msg)
-			return
-		}
-	}
-
 	var parentIssueID pgtype.UUID
 	var projectID pgtype.UUID
 	if req.ProjectID != nil {
@@ -878,13 +934,12 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.ParentIssueID != nil {
 		parentIssueID = parseUUID(*req.ParentIssueID)
 		// Validate parent exists in the same workspace.
-		parent, err := h.Queries.GetIssueInWorkspace(r.Context(), db.GetIssueInWorkspaceParams{
+		parent, err := h.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
 			ID:          parentIssueID,
 			WorkspaceID: parseUUID(workspaceID),
 		})
 		if err != nil || !parent.ID.Valid {
-			writeError(w, http.StatusBadRequest, "parent issue not found in this workspace")
-			return
+			return nil, db.Issue{}, errCreateIssueInvalidParent
 		}
 		if req.ProjectID == nil {
 			projectID = parent.ProjectID
@@ -895,8 +950,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if req.DueDate != nil && *req.DueDate != "" {
 		t, err := time.Parse(time.RFC3339, *req.DueDate)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid due_date format, expected RFC3339")
-			return
+			return nil, db.Issue{}, errCreateIssueInvalidDueDate
 		}
 		dueDate = pgtype.Timestamptz{Time: t, Valid: true}
 	}
@@ -906,21 +960,26 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	// returned representation. Falls through to legacy direct-DB path when
 	// no connection exists.
 	if h.GitlabEnabled && h.GitlabResolver != nil {
-		wsConn, err := h.Queries.GetWorkspaceGitlabConnection(r.Context(), parseUUID(workspaceID))
+		wsConn, err := h.Queries.GetWorkspaceGitlabConnection(ctx, parseUUID(workspaceID))
 		if err == nil {
-			actorType, actorID := h.resolveActor(r, creatorID, workspaceID)
-			token, _, err := h.GitlabResolver.ResolveTokenForWrite(r.Context(), workspaceID, actorType, actorID)
+			token, _, err := h.GitlabResolver.ResolveTokenForWrite(ctx, workspaceID, actorType, actorID)
 			if err != nil {
 				slog.Error("resolve gitlab token", "error", err)
-				writeError(w, http.StatusBadGateway, "could not resolve gitlab token")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusBadGateway,
+					msg:    "could not resolve gitlab token",
+					err:    err,
+				}
 			}
 
-			agentSlugMap, err := h.buildAgentUUIDSlugMap(r.Context(), parseUUID(workspaceID))
+			agentSlugMap, err := h.buildAgentUUIDSlugMap(ctx, parseUUID(workspaceID))
 			if err != nil {
 				slog.Error("agent slug map", "error", err)
-				writeError(w, http.StatusInternalServerError, "build agent map failed")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusInternalServerError,
+					msg:    "build agent map failed",
+					err:    err,
+				}
 			}
 
 			var assigneeTypeStr, assigneeIDStr string
@@ -934,6 +993,25 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			if req.Description != nil {
 				descStr = *req.Description
 			}
+
+			// Resolve the requested member assignee (if any) to a GitLab user ID
+			// so the translator can populate GitLab's native assignee_ids. When
+			// the member has no user_gitlab_connection, they're absent from the
+			// map and the translator falls back to cache-only semantics.
+			memberUUIDs := []string{}
+			if assigneeTypeStr == "member" && assigneeIDStr != "" {
+				memberUUIDs = append(memberUUIDs, assigneeIDStr)
+			}
+			memberGitlabMap, err := h.buildMemberGitlabUserMap(ctx, parseUUID(workspaceID), memberUUIDs)
+			if err != nil {
+				slog.Error("member gitlab user map", "error", err)
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusInternalServerError,
+					msg:    "build member map failed",
+					err:    err,
+				}
+			}
+
 			glInput := gitlabsync.BuildCreateIssueInput(gitlabsync.CreateIssueRequest{
 				Title:        req.Title,
 				Description:  descStr,
@@ -941,13 +1019,16 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 				Priority:     priority,
 				AssigneeType: assigneeTypeStr,
 				AssigneeID:   assigneeIDStr,
-			}, agentSlugMap)
+			}, agentSlugMap, memberGitlabMap)
 
-			glIssue, err := h.Gitlab.CreateIssue(r.Context(), token, wsConn.GitlabProjectID, glInput)
+			glIssue, err := h.Gitlab.CreateIssue(ctx, token, wsConn.GitlabProjectID, glInput)
 			if err != nil {
 				slog.Error("gitlab create issue", "error", err)
-				writeError(w, http.StatusBadGateway, "gitlab create issue failed")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusBadGateway,
+					msg:    "gitlab create issue failed",
+					err:    err,
+				}
 			}
 
 			// Build the inverse slug→uuid map for the read-side translator.
@@ -957,39 +1038,62 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			}
 			values := gitlabsync.TranslateIssue(*glIssue, &gitlabsync.TranslateContext{AgentBySlug: agentByLabel})
 
+			// Preserve the requested member assignee in the cache when the
+			// translator didn't resolve one from the GitLab response. This
+			// handles the unmapped-member case (no user_gitlab_connection):
+			// GitLab can't echo an assignee we never sent, but Multica should
+			// still record the member assignment locally. The translator's
+			// agent resolution takes precedence when a label was present.
+			if values.AssigneeType == "" && assigneeTypeStr == "member" && assigneeIDStr != "" {
+				values.AssigneeType = "member"
+				values.AssigneeID = assigneeIDStr
+			}
+
 			// Atomically increment the workspace issue counter and cache the GitLab row.
-			glTx, err := h.TxStarter.Begin(r.Context())
+			glTx, err := h.TxStarter.Begin(ctx)
 			if err != nil {
 				slog.Error("begin gitlab write-through tx", "error", err)
-				writeError(w, http.StatusInternalServerError, "failed to create issue")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusInternalServerError,
+					msg:    "failed to create issue",
+					err:    err,
+				}
 			}
-			defer glTx.Rollback(r.Context())
+			defer glTx.Rollback(ctx)
 
 			qtxGL := h.Queries.WithTx(glTx)
-			issueNumber, err := qtxGL.IncrementIssueCounter(r.Context(), parseUUID(workspaceID))
+			issueNumber, err := qtxGL.IncrementIssueCounter(ctx, parseUUID(workspaceID))
 			if err != nil {
 				slog.Error("increment issue counter (gitlab)", "error", err)
-				writeError(w, http.StatusInternalServerError, "failed to create issue")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusInternalServerError,
+					msg:    "failed to create issue",
+					err:    err,
+				}
 			}
 
-			cacheRow, err := qtxGL.UpsertIssueFromGitlab(r.Context(), buildUpsertParamsFromCreate(parseUUID(workspaceID), wsConn.GitlabProjectID, *glIssue, values))
+			cacheRow, err := qtxGL.UpsertIssueFromGitlab(ctx, buildUpsertParamsFromCreate(parseUUID(workspaceID), wsConn.GitlabProjectID, *glIssue, values))
 			if err != nil {
 				slog.Error("upsert gitlab cache row", "error", err)
-				writeError(w, http.StatusInternalServerError, "cache upsert failed")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusInternalServerError,
+					msg:    "cache upsert failed",
+					err:    err,
+				}
 			}
 
 			// Set the workspace-scoped issue number (UpsertIssueFromGitlab always
 			// inserts 0 by default; we update it here within the same transaction).
-			if _, err := glTx.Exec(r.Context(),
+			if _, err := glTx.Exec(ctx,
 				`UPDATE issue SET number = $1 WHERE id = $2`,
 				issueNumber, cacheRow.ID,
 			); err != nil {
 				slog.Error("set issue number (gitlab)", "error", err)
-				writeError(w, http.StatusInternalServerError, "failed to create issue")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusInternalServerError,
+					msg:    "failed to create issue",
+					err:    err,
+				}
 			}
 			cacheRow.Number = issueNumber
 
@@ -1001,7 +1105,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			// the just-upserted row's values through COALESCE/narg slots so
 			// only parent/project actually change.
 			if parentIssueID.Valid || projectID.Valid {
-				patched, err := qtxGL.UpdateIssue(r.Context(), db.UpdateIssueParams{
+				patched, err := qtxGL.UpdateIssue(ctx, db.UpdateIssueParams{
 					ID:            cacheRow.ID,
 					AssigneeType:  cacheRow.AssigneeType,
 					AssigneeID:    cacheRow.AssigneeID,
@@ -1011,8 +1115,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 				})
 				if err != nil {
 					slog.Error("patch parent/project on gitlab cache row", "error", err)
-					writeError(w, http.StatusInternalServerError, "failed to create issue")
-					return
+					return nil, db.Issue{}, &writeThroughError{
+						status: http.StatusInternalServerError,
+						msg:    "failed to create issue",
+						err:    err,
+					}
 				}
 				cacheRow = patched
 			}
@@ -1024,21 +1131,27 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 				for i, id := range req.AttachmentIDs {
 					attachmentUUIDs[i] = parseUUID(id)
 				}
-				if err := qtxGL.LinkAttachmentsToIssue(r.Context(), db.LinkAttachmentsToIssueParams{
+				if err := qtxGL.LinkAttachmentsToIssue(ctx, db.LinkAttachmentsToIssueParams{
 					IssueID:     cacheRow.ID,
 					WorkspaceID: cacheRow.WorkspaceID,
 					Column3:     attachmentUUIDs,
 				}); err != nil {
 					slog.Error("link attachments to gitlab issue", "error", err)
-					writeError(w, http.StatusInternalServerError, "failed to create issue")
-					return
+					return nil, db.Issue{}, &writeThroughError{
+						status: http.StatusInternalServerError,
+						msg:    "failed to create issue",
+						err:    err,
+					}
 				}
 			}
 
-			if err := glTx.Commit(r.Context()); err != nil {
+			if err := glTx.Commit(ctx); err != nil {
 				slog.Error("commit gitlab write-through tx", "error", err)
-				writeError(w, http.StatusInternalServerError, "failed to create issue")
-				return
+				return nil, db.Issue{}, &writeThroughError{
+					status: http.StatusInternalServerError,
+					msg:    "failed to create issue",
+					err:    err,
+				}
 			}
 
 			// Enqueue an agent task when the persisted cache row resolved to an
@@ -1046,18 +1159,18 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			// a separate concern from the GitLab/DB write (matches legacy path
 			// tail: a failed enqueue must not roll back the created issue).
 			if cacheRow.AssigneeType.Valid && cacheRow.AssigneeID.Valid {
-				if h.shouldEnqueueAgentTask(r.Context(), cacheRow) {
-					h.TaskService.EnqueueTaskForIssue(r.Context(), cacheRow)
+				if h.shouldEnqueueAgentTask(ctx, cacheRow) {
+					h.TaskService.EnqueueTaskForIssue(ctx, cacheRow)
 				}
 			}
 
-			prefix := h.getIssuePrefix(r.Context(), cacheRow.WorkspaceID)
+			prefix := h.getIssuePrefix(ctx, cacheRow.WorkspaceID)
 			resp := issueToResponse(cacheRow, prefix)
 
 			// Mirror the legacy path: when attachments were linked, fetch them
 			// so the response carries the populated Attachments slice.
 			if len(req.AttachmentIDs) > 0 {
-				attachments, err := h.Queries.ListAttachmentsByIssue(r.Context(), db.ListAttachmentsByIssueParams{
+				attachments, err := h.Queries.ListAttachmentsByIssue(ctx, db.ListAttachmentsByIssueParams{
 					IssueID:     cacheRow.ID,
 					WorkspaceID: cacheRow.WorkspaceID,
 				})
@@ -1070,8 +1183,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			}
 
 			h.publish(protocol.EventIssueCreated, workspaceID, actorType, actorID, map[string]any{"issue": resp})
-			writeJSON(w, http.StatusCreated, resp)
-			return
+			return &resp, cacheRow, nil
 		}
 		// err != nil → fall through to legacy path (most likely pgx.ErrNoRows
 		// for non-connected workspaces).
@@ -1079,62 +1191,53 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 	// Use a transaction to atomically increment the workspace issue counter
 	// and create the issue with the assigned number.
-	tx, err := h.TxStarter.Begin(r.Context())
+	tx, err := h.TxStarter.Begin(ctx)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create issue")
-		return
+		return nil, db.Issue{}, fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(ctx)
 
 	qtx := h.Queries.WithTx(tx)
-	issueNumber, err := qtx.IncrementIssueCounter(r.Context(), parseUUID(workspaceID))
+	issueNumber, err := qtx.IncrementIssueCounter(ctx, parseUUID(workspaceID))
 	if err != nil {
-		slog.Warn("increment issue counter failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
-		writeError(w, http.StatusInternalServerError, "failed to create issue")
-		return
+		return nil, db.Issue{}, fmt.Errorf("increment issue counter: %w", err)
 	}
 
-	// Determine creator identity: agent (via X-Agent-ID header) or member.
-	creatorType, actualCreatorID := h.resolveActor(r, creatorID, workspaceID)
-
-	issue, err := qtx.CreateIssue(r.Context(), db.CreateIssueParams{
-		WorkspaceID:        parseUUID(workspaceID),
-		Title:              req.Title,
-		Description:        ptrToText(req.Description),
-		Status:             status,
-		Priority:           priority,
-		AssigneeType:       assigneeType,
-		AssigneeID:         assigneeID,
-		CreatorType:        pgtype.Text{String: creatorType, Valid: creatorType != ""},
-		CreatorID:          parseUUID(actualCreatorID),
-		ParentIssueID:      parentIssueID,
-		Position:           0,
-		DueDate:            dueDate,
-		Number:             issueNumber,
-		ProjectID:          projectID,
+	issue, err := qtx.CreateIssue(ctx, db.CreateIssueParams{
+		WorkspaceID:   parseUUID(workspaceID),
+		Title:         req.Title,
+		Description:   ptrToText(req.Description),
+		Status:        status,
+		Priority:      priority,
+		AssigneeType:  assigneeType,
+		AssigneeID:    assigneeID,
+		CreatorType:   pgtype.Text{String: actorType, Valid: actorType != ""},
+		CreatorID:     parseUUID(actorID),
+		ParentIssueID: parentIssueID,
+		Position:      0,
+		DueDate:       dueDate,
+		Number:        issueNumber,
+		ProjectID:     projectID,
 	})
 	if err != nil {
-		slog.Warn("create issue failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
-		writeError(w, http.StatusInternalServerError, "failed to create issue: "+err.Error())
-		return
+		return nil, db.Issue{}, fmt.Errorf("create issue: %w", err)
 	}
 
-	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create issue")
-		return
+	if err := tx.Commit(ctx); err != nil {
+		return nil, db.Issue{}, fmt.Errorf("commit tx: %w", err)
 	}
 
 	// Link any pre-uploaded attachments to this issue.
 	if len(req.AttachmentIDs) > 0 {
-		h.linkAttachmentsByIssueIDs(r.Context(), issue.ID, issue.WorkspaceID, req.AttachmentIDs)
+		h.linkAttachmentsByIssueIDs(ctx, issue.ID, issue.WorkspaceID, req.AttachmentIDs)
 	}
 
-	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
+	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
 	resp := issueToResponse(issue, prefix)
 
 	// Fetch linked attachments so they appear in the response.
 	if len(req.AttachmentIDs) > 0 {
-		attachments, err := h.Queries.ListAttachmentsByIssue(r.Context(), db.ListAttachmentsByIssueParams{
+		attachments, err := h.Queries.ListAttachmentsByIssue(ctx, db.ListAttachmentsByIssueParams{
 			IssueID:     issue.ID,
 			WorkspaceID: issue.WorkspaceID,
 		})
@@ -1146,17 +1249,72 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
-	h.publish(protocol.EventIssueCreated, workspaceID, creatorType, actualCreatorID, map[string]any{"issue": resp})
+	h.publish(protocol.EventIssueCreated, workspaceID, actorType, actorID, map[string]any{"issue": resp})
 
 	// Enqueue agent task when an agent-assigned issue is created.
 	if issue.AssigneeType.Valid && issue.AssigneeID.Valid {
-		if h.shouldEnqueueAgentTask(r.Context(), issue) {
-			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
+		if h.shouldEnqueueAgentTask(ctx, issue) {
+			h.TaskService.EnqueueTaskForIssue(ctx, issue)
 		}
 	}
 
-	writeJSON(w, http.StatusCreated, resp)
+	return &resp, issue, nil
+}
+
+// CreateIssueForAutopilot adapts CreateIssueInternal to the service-side
+// IssueCreator interface (service.IssueCreator). The autopilot service calls
+// this instead of talking to CreateIssue / CreateIssueInternal directly,
+// which keeps it decoupled from the handler's HTTP request types.
+//
+// Returns the created cache row so the autopilot service can key its
+// autopilot_issue mapping off the row's gitlab_iid (when the workspace is
+// connected).
+func (h *Handler) CreateIssueForAutopilot(
+	ctx context.Context,
+	workspaceID, actorType, actorID string,
+	req service.AutopilotIssueCreateRequest,
+) (db.Issue, error) {
+	desc := req.Description
+	assigneeType := req.AssigneeType
+	assigneeID := req.AssigneeID
+	createReq := CreateIssueRequest{
+		Title:        req.Title,
+		Description:  &desc,
+		Status:       req.Status,
+		Priority:     req.Priority,
+		AssigneeType: &assigneeType,
+		AssigneeID:   &assigneeID,
+	}
+	_, cacheRow, err := h.CreateIssueInternal(ctx, workspaceID, actorType, actorID, createReq)
+	return cacheRow, err
+}
+
+// buildMemberGitlabUserMap resolves the Multica member UUIDs referenced in a
+// request to their GitLab user IDs. Used by write-through handlers that need
+// to set GitLab's native assignee_ids. Unmapped members (user without a PAT
+// connection) are absent from the returned map — the translator falls back to
+// cache-only behavior for them.
+func (h *Handler) buildMemberGitlabUserMap(ctx context.Context, workspaceID pgtype.UUID, memberUUIDs []string) (map[string]int64, error) {
+	out := make(map[string]int64, len(memberUUIDs))
+	for _, memberUUID := range memberUUIDs {
+		if memberUUID == "" {
+			continue
+		}
+		conn, err := h.Queries.GetUserGitlabConnection(ctx, db.GetUserGitlabConnectionParams{
+			UserID:      parseUUID(memberUUID),
+			WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			return nil, err
+		}
+		if conn.GitlabUserID != 0 {
+			out[memberUUID] = conn.GitlabUserID
+		}
+	}
+	return out, nil
 }
 
 // buildUpsertParamsFromCreate converts a GitLab issue + translated IssueValues
@@ -1443,7 +1601,31 @@ func (h *Handler) updateSingleIssueWriteThrough(
 			clear.DueDate = true
 		}
 	}
-	glInput := gitlabsync.BuildUpdateIssueInput(oldSnap, translatorReq, agentSlugByUUID)
+
+	// Resolve member assignees (old + new) to GitLab user IDs so the
+	// translator can populate GitLab's native assignee_ids. We include the
+	// PREV member UUID so transitions off a member can participate in the
+	// map (the translator doesn't use it today, but keeping both sides is
+	// symmetric with Create and cheap). Unmapped members are absent from
+	// the map — translator leaves AssigneeIDs nil and the handler falls
+	// back to a cache-only write below.
+	memberUUIDs := []string{}
+	if prevIssue.AssigneeType.Valid && prevIssue.AssigneeType.String == "member" && prevIssue.AssigneeID.Valid {
+		memberUUIDs = append(memberUUIDs, uuidToString(prevIssue.AssigneeID))
+	}
+	if req.AssigneeType != nil && *req.AssigneeType == "member" && req.AssigneeID != nil && *req.AssigneeID != "" {
+		memberUUIDs = append(memberUUIDs, *req.AssigneeID)
+	}
+	memberGitlabMap, mapErr := h.buildMemberGitlabUserMap(ctx, prevIssue.WorkspaceID, memberUUIDs)
+	if mapErr != nil {
+		slog.Error("member gitlab user map", "error", mapErr)
+		return nil, db.Issue{}, &writeThroughError{
+			status: http.StatusInternalServerError,
+			msg:    "build member map failed",
+			err:    mapErr,
+		}
+	}
+	glInput := gitlabsync.BuildUpdateIssueInput(oldSnap, translatorReq, agentSlugByUUID, memberGitlabMap)
 
 	if !prevIssue.GitlabIid.Valid || !prevIssue.GitlabProjectID.Valid {
 		// Defensive: a cache row on a GitLab-connected workspace that
@@ -1548,16 +1730,21 @@ func (h *Handler) updateSingleIssueWriteThrough(
 			touched = true
 		}
 	}
-	// Member assignees are cache-only in Phase 3b (no GitLab user
-	// mapping yet — the translator currently drops member assignees
-	// from the GitLab payload). Apply them directly to the cache.
-	if req.AssigneeType != nil && *req.AssigneeType == "member" {
+	// Member assignees (Phase 4): the translator resolves mapped members to
+	// GitLab's native assignee_ids so GitLab holds the authoritative state.
+	// The cache, however, keys on Multica UUIDs — not GitLab user IDs —
+	// and TranslateIssue doesn't reverse-resolve on its own (it only
+	// surfaces GitlabAssigneeUserID for caller-side lookup). We patch the
+	// cache row from the REQUEST here so the Multica UUID lands in
+	// assignee_id. This covers both:
+	//   - Mapped members: GitLab received assignee_ids: [N]; we write the
+	//     member UUID so the cache matches the request (reverse-resolution
+	//     via user_gitlab_connection would yield the same UUID).
+	//   - Unmapped members: GitLab got nothing (assignee_ids omitted),
+	//     cache-only fallback preserves the member locally.
+	if req.AssigneeType != nil && *req.AssigneeType == "member" && req.AssigneeID != nil && *req.AssigneeID != "" {
 		updParams.AssigneeType = pgtype.Text{String: "member", Valid: true}
-		if req.AssigneeID != nil {
-			updParams.AssigneeID = parseUUID(*req.AssigneeID)
-		} else {
-			updParams.AssigneeID = pgtype.UUID{Valid: false}
-		}
+		updParams.AssigneeID = parseUUID(*req.AssigneeID)
 		touched = true
 	}
 	if touched {

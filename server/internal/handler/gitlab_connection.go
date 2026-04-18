@@ -132,8 +132,9 @@ func (h *Handler) ConnectGitlabWorkspace(w http.ResponseWriter, r *http.Request)
 		syncCtx, cancel := context.WithTimeout(parent, 10*time.Minute)
 		defer cancel()
 		if err := gitlabsync.RunInitialSync(syncCtx, gitlabsync.SyncDeps{
-			Queries: h.Queries,
-			Client:  h.Gitlab,
+			Queries:  h.Queries,
+			Client:   h.Gitlab,
+			Resolver: h.GitlabResolver,
 		}, gitlabsync.RunInitialSyncInput{
 			WorkspaceID: wsID,
 			ProjectID:   projectID,

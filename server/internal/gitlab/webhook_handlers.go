@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,27 +14,60 @@ import (
 	gitlabapi "github.com/multica-ai/multica/server/pkg/gitlab"
 )
 
+// TaskEnqueuer is the minimal surface the webhook handlers need from the
+// task service to enqueue agent work. Defining it locally avoids importing
+// internal/service (which would create a package cycle once service grows
+// gitlab-aware code) and lets tests supply a no-op/recording stub.
+type TaskEnqueuer interface {
+	EnqueueTaskForIssue(ctx context.Context, issue db.Issue, triggerCommentID ...pgtype.UUID) (db.AgentTaskQueue, error)
+}
+
 // WebhookDeps is what every per-event handler needs. The worker constructs
 // this once per event.
+//
+// Resolver is optional: when non-nil, handlers use it to reverse-resolve
+// GitLab user IDs to Multica member UUIDs (and fall back to gitlab_project_member
+// for issue assignees). When nil, handlers leave Multica author/actor/assignee
+// columns NULL and preserve only the raw gitlab_*_user_id hint — matching the
+// pre-Phase-4 behavior.
+//
+// TaskEnqueuer is optional: when non-nil, ApplyIssueHookEvent enqueues an
+// agent task after the upsert if the assignment changed to a (new) agent
+// — mirroring the write-through path in handler/issue.go. When nil, the
+// webhook path applies cache changes but does NOT spawn agent work.
 type WebhookDeps struct {
-	Queries     *db.Queries
-	WorkspaceID pgtype.UUID
-	ProjectID   int64
+	Queries      *db.Queries
+	WorkspaceID  pgtype.UUID
+	ProjectID    int64
+	Resolver     *Resolver
+	TaskEnqueuer TaskEnqueuer
 }
 
 // issueHookPayload is the subset of the Issue Hook body we read.
 type issueHookPayload struct {
 	ObjectAttributes struct {
-		IID         int      `json:"iid"`
-		Title       string   `json:"title"`
-		Description string   `json:"description"`
-		State       string   `json:"state"`
-		UpdatedAt   string   `json:"updated_at"`
-		DueDate     string   `json:"due_date"`
+		IID         int    `json:"iid"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		State       string `json:"state"`
+		UpdatedAt   string `json:"updated_at"`
+		DueDate     string `json:"due_date"`
 		Labels      []struct {
 			Title string `json:"title"`
 		} `json:"labels"`
 	} `json:"object_attributes"`
+	// Assignees is the native GitLab assignee list. Populated from the
+	// top-level `assignees` array in the hook payload. We use the first entry
+	// as the assignee (GitLab issues support multiple assignees on some
+	// tiers; Multica mirrors a single slot).
+	Assignees []struct {
+		ID int64 `json:"id"`
+	} `json:"assignees"`
+	// User is the issue author (creator) — GitLab sends this as a sibling
+	// of `object_attributes`, not inside it.
+	User struct {
+		ID int64 `json:"id"`
+	} `json:"user"`
 }
 
 // ApplyIssueHookEvent applies one Issue Hook event to the cache. Reuses the
@@ -58,12 +92,18 @@ func ApplyIssueHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 	for _, l := range p.ObjectAttributes.Labels {
 		labels = append(labels, l.Title)
 	}
+	assignees := make([]gitlabapi.User, 0, len(p.Assignees))
+	for _, a := range p.Assignees {
+		assignees = append(assignees, gitlabapi.User{ID: a.ID})
+	}
 	apiIssue := gitlabapi.Issue{
 		IID:         p.ObjectAttributes.IID,
 		Title:       p.ObjectAttributes.Title,
 		Description: p.ObjectAttributes.Description,
 		State:       p.ObjectAttributes.State,
 		Labels:      labels,
+		Assignees:   assignees,
+		Author:      gitlabapi.User{ID: p.User.ID},
 		DueDate:     p.ObjectAttributes.DueDate,
 		UpdatedAt:   p.ObjectAttributes.UpdatedAt,
 	}
@@ -74,8 +114,52 @@ func ApplyIssueHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 	}
 	values := TranslateIssue(apiIssue, &TranslateContext{AgentBySlug: agentMap})
 
-	if _, err := deps.Queries.UpsertIssueFromGitlab(ctx, buildUpsertIssueParams(deps.WorkspaceID, deps.ProjectID, apiIssue, values)); err != nil {
+	// Reverse-resolve native GitLab assignee when no agent::<slug> label set it.
+	// Agent labels always win (Multica semantics prefer agent assignment).
+	if values.AssigneeType == "" && values.GitlabAssigneeUserID != 0 && deps.Resolver != nil {
+		ut, uid, memID, rErr := deps.Resolver.ResolveMulticaUserFromGitlabUserID(ctx, uuidString(deps.WorkspaceID), values.GitlabAssigneeUserID)
+		if rErr != nil {
+			return fmt.Errorf("resolve assignee: %w", rErr)
+		}
+		switch ut {
+		case "member":
+			values.AssigneeType = "member"
+			values.AssigneeID = uid
+		case "gitlab_user":
+			values.AssigneeType = "gitlab_user"
+			values.AssigneeID = memID
+		}
+		// "" → unmapped; leave values.AssigneeType empty, cache stays NULL.
+	}
+
+	creatorType, creatorID, err := resolveCreatorFromGitlabID(ctx, deps.Resolver, uuidString(deps.WorkspaceID), values.CreatorGitlabUserID)
+	if err != nil {
+		return fmt.Errorf("resolve creator: %w", err)
+	}
+
+	cacheRow, err := deps.Queries.UpsertIssueFromGitlab(ctx, buildUpsertIssueParams(deps.WorkspaceID, deps.ProjectID, apiIssue, values, creatorType, creatorID))
+	if err != nil {
 		return fmt.Errorf("upsert issue: %w", err)
+	}
+
+	// Enqueue an agent task when the GitLab-originated update JUST moved the
+	// issue into an agent assignment (or switched to a different agent). This
+	// closes the "human adds ~agent::<slug> from gitlab.com" gap that Phase 2a
+	// left open — the write-through path in handler/issue.go already enqueues
+	// on the POST/PATCH route, but a webhook-only assignment never reached the
+	// task queue until Phase 4. Change detection compares prior cache row vs.
+	// fresh upsert row so webhook replays and unrelated updates (title-only,
+	// description-only) don't spawn duplicate tasks.
+	if deps.TaskEnqueuer != nil && shouldEnqueueAgentOnWebhook(existing, cacheRow) {
+		if _, err := deps.TaskEnqueuer.EnqueueTaskForIssue(ctx, cacheRow); err != nil {
+			// Match the write-through tail: a failed enqueue must not fail the
+			// webhook event (the cache update already landed). Log and move on;
+			// the reconciler / next webhook delivery will retry naturally.
+			slog.Error("webhook issue hook: enqueue agent task failed",
+				"workspace_id", uuidString(deps.WorkspaceID),
+				"issue_id", uuidString(cacheRow.ID),
+				"err", err)
+		}
 	}
 
 	// Note: this handler doesn't update issue_gitlab_label junction rows. The
@@ -87,6 +171,36 @@ func ApplyIssueHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 	// associations. Phase 3 may add a label-by-name resolver here if real-time
 	// per-issue label drift becomes a UX problem.
 	return nil
+}
+
+// shouldEnqueueAgentOnWebhook decides whether the post-upsert cache row
+// represents a fresh agent assignment worth spawning a task for. Returns
+// true only when the current row is agent-assigned, NOT in backlog, AND
+// (the prior row was NOT an agent, OR it was a different agent).
+// Same-agent replays are no-ops.
+//
+// Backlog status gate matches the handler's write-through path
+// (shouldEnqueueAgentTask): issues parked in backlog don't auto-run even
+// when an agent is assigned. The webhook payload's labels drive status
+// via TranslateIssue in the same step, so the gate sees the authoritative
+// new-state status. TaskEnqueuer.EnqueueTaskForIssue additionally requires
+// a non-archived agent with a runtime — unready agents silently no-op.
+func shouldEnqueueAgentOnWebhook(prior, cur db.Issue) bool {
+	if !cur.AssigneeType.Valid || cur.AssigneeType.String != "agent" {
+		return false
+	}
+	if !cur.AssigneeID.Valid {
+		return false
+	}
+	if cur.Status == "backlog" {
+		return false
+	}
+	// Brand-new issue OR prior wasn't agent-assigned → enqueue.
+	if !prior.AssigneeType.Valid || prior.AssigneeType.String != "agent" || !prior.AssigneeID.Valid {
+		return true
+	}
+	// Swapped to a different agent → enqueue.
+	return prior.AssigneeID != cur.AssigneeID
 }
 
 type noteHookPayload struct {
@@ -151,6 +265,20 @@ func ApplyNoteHookEvent(ctx context.Context, deps WebhookDeps, body []byte) erro
 			authorType = pgtype.Text{String: "agent", Valid: true}
 			_ = authorID.Scan(uuidStr)
 		}
+	} else if nv.GitlabUserID != 0 && deps.Resolver != nil {
+		// Human-authored note: reverse-resolve the GitLab user ID to a
+		// Multica member when possible. The comment table's author_type
+		// CHECK constraint only permits 'member' or 'agent' (not
+		// 'gitlab_user'), so unmapped GitLab users leave author_type NULL
+		// and rely on gitlab_author_user_id for UI display.
+		ut, uid, _, rErr := deps.Resolver.ResolveMulticaUserFromGitlabUserID(ctx, uuidString(deps.WorkspaceID), nv.GitlabUserID)
+		if rErr != nil {
+			return fmt.Errorf("resolve author: %w", rErr)
+		}
+		if ut == "member" {
+			authorType = pgtype.Text{String: "member", Valid: true}
+			_ = authorID.Scan(uid)
+		}
 	}
 	var glUser pgtype.Int8
 	if nv.GitlabUserID != 0 {
@@ -193,38 +321,79 @@ type emojiHookPayload struct {
 	} `json:"user"`
 }
 
-// ApplyEmojiHookEvent caches an issue-level award emoji.
-// Note-level awards (reactions on comments) are NOT mirrored.
+// ApplyEmojiHookEvent caches an award emoji. Supports both Issue-level and
+// Note-level awards (the latter via comment_reaction).
 func ApplyEmojiHookEvent(ctx context.Context, deps WebhookDeps, body []byte) error {
 	var p emojiHookPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		return fmt.Errorf("decode emoji hook: %w", err)
 	}
-	if p.ObjectAttributes.AwardableType != "Issue" {
-		return nil
-	}
-	parent, err := deps.Queries.GetIssueByGitlabID(ctx, db.GetIssueByGitlabIDParams{
-		WorkspaceID:   deps.WorkspaceID,
-		GitlabIssueID: pgtype.Int8{Int64: p.ObjectAttributes.AwardableID, Valid: true},
-	})
-	if err != nil {
-		return fmt.Errorf("parent issue not yet cached (gitlab_id=%d): %w", p.ObjectAttributes.AwardableID, err)
+
+	// Resolve actor once — same logic for issue vs. note awards. The
+	// issue_reaction / comment_reaction tables both permit NULL actor refs,
+	// so "gitlab_user" and unmapped both leave Multica actor columns NULL
+	// and rely on gitlab_actor_user_id for display.
+	var actorType pgtype.Text
+	var actorID pgtype.UUID
+	if p.User.ID != 0 && deps.Resolver != nil {
+		ut, uid, _, rErr := deps.Resolver.ResolveMulticaUserFromGitlabUserID(ctx, uuidString(deps.WorkspaceID), p.User.ID)
+		if rErr != nil {
+			return fmt.Errorf("resolve actor: %w", rErr)
+		}
+		if ut == "member" {
+			actorType = pgtype.Text{String: "member", Valid: true}
+			_ = actorID.Scan(uid)
+		}
 	}
 	var glUser pgtype.Int8
 	if p.User.ID != 0 {
 		glUser = pgtype.Int8{Int64: p.User.ID, Valid: true}
 	}
-	if _, err := deps.Queries.UpsertIssueReactionFromGitlab(ctx, db.UpsertIssueReactionFromGitlabParams{
-		WorkspaceID:       deps.WorkspaceID,
-		IssueID:           parent.ID,
-		ActorType:         pgtype.Text{},
-		ActorID:           pgtype.UUID{},
-		GitlabActorUserID: glUser,
-		Emoji:             p.ObjectAttributes.Name,
-		GitlabAwardID:     pgtype.Int8{Int64: p.ObjectAttributes.ID, Valid: true},
-		ExternalUpdatedAt: parseTS(p.ObjectAttributes.UpdatedAt),
-	}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("upsert reaction: %w", err)
+
+	switch p.ObjectAttributes.AwardableType {
+	case "Issue":
+		parent, err := deps.Queries.GetIssueByGitlabID(ctx, db.GetIssueByGitlabIDParams{
+			WorkspaceID:   deps.WorkspaceID,
+			GitlabIssueID: pgtype.Int8{Int64: p.ObjectAttributes.AwardableID, Valid: true},
+		})
+		if err != nil {
+			return fmt.Errorf("parent issue not yet cached (gitlab_id=%d): %w", p.ObjectAttributes.AwardableID, err)
+		}
+		if _, err := deps.Queries.UpsertIssueReactionFromGitlab(ctx, db.UpsertIssueReactionFromGitlabParams{
+			WorkspaceID:       deps.WorkspaceID,
+			IssueID:           parent.ID,
+			ActorType:         actorType,
+			ActorID:           actorID,
+			GitlabActorUserID: glUser,
+			Emoji:             p.ObjectAttributes.Name,
+			GitlabAwardID:     pgtype.Int8{Int64: p.ObjectAttributes.ID, Valid: true},
+			ExternalUpdatedAt: parseTS(p.ObjectAttributes.UpdatedAt),
+		}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("upsert issue reaction: %w", err)
+		}
+	case "Note":
+		// Note-level awards: look up the parent comment by gitlab_note_id
+		// (awardable_id is the note id for Note-type awards).
+		parent, err := deps.Queries.GetCommentByGitlabNoteID(ctx, pgtype.Int8{Int64: p.ObjectAttributes.AwardableID, Valid: true})
+		if err != nil {
+			return fmt.Errorf("parent comment not yet cached (gitlab_note_id=%d): %w", p.ObjectAttributes.AwardableID, err)
+		}
+		if _, err := deps.Queries.UpsertCommentReactionFromGitlab(ctx, db.UpsertCommentReactionFromGitlabParams{
+			WorkspaceID:       deps.WorkspaceID,
+			CommentID:         parent.ID,
+			ActorType:         actorType,
+			ActorID:           actorID,
+			GitlabActorUserID: glUser,
+			Emoji:             p.ObjectAttributes.Name,
+			GitlabAwardID:     pgtype.Int8{Int64: p.ObjectAttributes.ID, Valid: true},
+			ExternalUpdatedAt: parseTS(p.ObjectAttributes.UpdatedAt),
+		}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("upsert comment reaction: %w", err)
+		}
+	default:
+		// MergeRequest / Snippet / unknown awardables — Multica only mirrors
+		// issues + their comments.
+		return nil
 	}
 	return nil
 }

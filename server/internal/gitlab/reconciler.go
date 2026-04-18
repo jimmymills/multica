@@ -106,7 +106,11 @@ func (r *Reconciler) reconcileOne(ctx context.Context, conn db.WorkspaceGitlabCo
 	}
 	for _, issue := range issues {
 		values := TranslateIssue(issue, &TranslateContext{AgentBySlug: agentMap})
-		if _, err := r.queries.UpsertIssueFromGitlab(ctx, buildUpsertIssueParams(conn.WorkspaceID, conn.GitlabProjectID, issue, values)); err != nil {
+		// Reconciler does not reverse-resolve creator/assignee — Phase 2b
+		// webhook stream already keyed cache rows with those refs, and the
+		// reconciler only backstops drift on issue fields the hook may have
+		// missed. Creator type stays NULL for newly-reconciled rows.
+		if _, err := r.queries.UpsertIssueFromGitlab(ctx, buildUpsertIssueParams(conn.WorkspaceID, conn.GitlabProjectID, issue, values, "", "")); err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) {
 				return fmt.Errorf("upsert iid=%d: %w", issue.IID, err)
 			}

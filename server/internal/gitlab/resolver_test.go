@@ -13,8 +13,10 @@ import (
 // fakeResolverQueries lets us simulate "found" / "not found" for both
 // connection types without wiring a real DB.
 type fakeResolverQueries struct {
-	workspaceConn *db.WorkspaceGitlabConnection
-	userConn      *db.UserGitlabConnection
+	workspaceConn        *db.WorkspaceGitlabConnection
+	userConn             *db.UserGitlabConnection
+	userConnByGitlabUser *db.UserGitlabConnection
+	projectMember        *db.GitlabProjectMember
 }
 
 func (f *fakeResolverQueries) GetWorkspaceGitlabConnection(_ context.Context, _ pgtype.UUID) (db.WorkspaceGitlabConnection, error) {
@@ -31,6 +33,27 @@ func (f *fakeResolverQueries) GetUserGitlabConnection(_ context.Context, _ db.Ge
 	return *f.userConn, nil
 }
 
+func (f *fakeResolverQueries) GetUserGitlabConnectionByGitlabUserID(_ context.Context, _ db.GetUserGitlabConnectionByGitlabUserIDParams) (db.UserGitlabConnection, error) {
+	if f.userConnByGitlabUser == nil {
+		return db.UserGitlabConnection{}, pgx.ErrNoRows
+	}
+	return *f.userConnByGitlabUser, nil
+}
+
+func (f *fakeResolverQueries) GetGitlabProjectMember(_ context.Context, _ db.GetGitlabProjectMemberParams) (db.GitlabProjectMember, error) {
+	if f.projectMember == nil {
+		return db.GitlabProjectMember{}, pgx.ErrNoRows
+	}
+	return *f.projectMember, nil
+}
+
+// pgUUIDForTest parses a UUID string into pgtype.UUID for fake rows.
+func pgUUIDForTest(s string) pgtype.UUID {
+	var u pgtype.UUID
+	_ = u.Scan(s)
+	return u
+}
+
 // stubDecrypt returns the plaintext "{prefix}|{hex}" so tests can assert
 // which encrypted column we resolved against.
 func stubDecrypt(prefix string) TokenDecrypter {
@@ -45,6 +68,8 @@ func stubDecrypt(prefix string) TokenDecrypter {
 const (
 	workspaceUUID = "00000000-0000-0000-0000-000000000001"
 	userUUID      = "00000000-0000-0000-0000-000000000002"
+	multicaUserID = "00000000-0000-0000-0000-000000000003"
+	memberRowID   = "00000000-0000-0000-0000-000000000004"
 )
 
 func TestResolveTokenForWrite_HumanWithPATPicksUserPAT(t *testing.T) {
@@ -153,5 +178,72 @@ func TestResolveTokenForWrite_RejectsUnknownActorType(t *testing.T) {
 				t.Errorf("error = %q, want to contain %q", err.Error(), "unknown actor type")
 			}
 		})
+	}
+}
+
+func TestResolveMulticaUserFromGitlabUserID_UserGitlabConnectionWins(t *testing.T) {
+	q := &fakeResolverQueries{
+		userConnByGitlabUser: &db.UserGitlabConnection{
+			UserID:       pgUUIDForTest(multicaUserID),
+			WorkspaceID:  pgUUIDForTest(workspaceUUID),
+			GitlabUserID: 7,
+		},
+		// Even with a project member match, user connection wins.
+		projectMember: &db.GitlabProjectMember{
+			ID:           pgUUIDForTest(memberRowID),
+			WorkspaceID:  pgUUIDForTest(workspaceUUID),
+			GitlabUserID: 7,
+		},
+	}
+	r := NewResolver(q, stubDecrypt("dec"))
+	userType, userID, memberID, err := r.ResolveMulticaUserFromGitlabUserID(context.Background(), workspaceUUID, 7)
+	if err != nil {
+		t.Fatalf("ResolveMulticaUserFromGitlabUserID: %v", err)
+	}
+	if userType != "member" {
+		t.Errorf("userType = %q, want member", userType)
+	}
+	if userID != multicaUserID {
+		t.Errorf("userID = %q, want %q", userID, multicaUserID)
+	}
+	if memberID != "" {
+		t.Errorf("memberID should be empty when user-connection hit, got %q", memberID)
+	}
+}
+
+func TestResolveMulticaUserFromGitlabUserID_ProjectMemberFallback(t *testing.T) {
+	q := &fakeResolverQueries{
+		userConnByGitlabUser: nil, // no PAT connection
+		projectMember: &db.GitlabProjectMember{
+			ID:           pgUUIDForTest(memberRowID),
+			WorkspaceID:  pgUUIDForTest(workspaceUUID),
+			GitlabUserID: 7,
+		},
+	}
+	r := NewResolver(q, stubDecrypt("dec"))
+	userType, userID, memberID, err := r.ResolveMulticaUserFromGitlabUserID(context.Background(), workspaceUUID, 7)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if userType != "gitlab_user" {
+		t.Errorf("userType = %q, want gitlab_user", userType)
+	}
+	if userID != "" {
+		t.Errorf("userID should be empty for gitlab_user type, got %q", userID)
+	}
+	if memberID != memberRowID {
+		t.Errorf("memberID = %q, want %q", memberID, memberRowID)
+	}
+}
+
+func TestResolveMulticaUserFromGitlabUserID_NoMapping(t *testing.T) {
+	q := &fakeResolverQueries{} // both nil
+	r := NewResolver(q, stubDecrypt("dec"))
+	userType, userID, memberID, err := r.ResolveMulticaUserFromGitlabUserID(context.Background(), workspaceUUID, 7)
+	if err != nil {
+		t.Fatalf("unmapped user must not error, got %v", err)
+	}
+	if userType != "" || userID != "" || memberID != "" {
+		t.Errorf("expected all empty, got (%q, %q, %q)", userType, userID, memberID)
 	}
 }

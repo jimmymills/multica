@@ -25,6 +25,17 @@ type WebhookWorker struct {
 	tx         txStarter
 	numWorkers int
 	idleSleep  time.Duration
+	// decrypt is used only to construct a Resolver per-event for reverse
+	// user resolution. Reverse resolution itself never calls decrypt (it
+	// only reads the unencrypted identity-mapping tables), so a no-op
+	// decrypter is fine when webhook handlers don't need write-token
+	// resolution. Kept as a field for forward-compatibility.
+	decrypt TokenDecrypter
+	// taskEnqueuer is optional. When non-nil, ApplyIssueHookEvent hands
+	// off to it after the upsert so a human assigning ~agent::<slug> from
+	// gitlab.com spawns a task on the same path as the POST/PATCH route
+	// in handler/issue.go. Wired by cmd/server/main.go.
+	taskEnqueuer TaskEnqueuer
 }
 
 // NewWebhookWorker returns a worker that runs `numWorkers` goroutines and
@@ -36,7 +47,42 @@ func NewWebhookWorker(queries *db.Queries, tx txStarter, numWorkers int, idleSle
 	if idleSleep <= 0 {
 		idleSleep = 250 * time.Millisecond
 	}
-	return &WebhookWorker{queries: queries, tx: tx, numWorkers: numWorkers, idleSleep: idleSleep}
+	return &WebhookWorker{
+		queries:    queries,
+		tx:         tx,
+		numWorkers: numWorkers,
+		idleSleep:  idleSleep,
+		decrypt:    noopDecrypter,
+	}
+}
+
+// noopDecrypter is installed on workers that don't need write-token
+// resolution. Reverse user resolution never calls decrypt; if it ever does,
+// this will surface as a loud error rather than silently returning bytes
+// as a string.
+func noopDecrypter(_ context.Context, _ []byte) (string, error) {
+	return "", errors.New("webhook worker resolver: decrypt not available")
+}
+
+// WithDecrypter installs a TokenDecrypter on the worker. Optional — the
+// default no-op decrypter is sufficient for reverse user resolution (which
+// only reads unencrypted identity-mapping rows).
+func (w *WebhookWorker) WithDecrypter(d TokenDecrypter) *WebhookWorker {
+	if d != nil {
+		w.decrypt = d
+	}
+	return w
+}
+
+// WithTaskEnqueuer installs a TaskEnqueuer on the worker so the issue-hook
+// handler can spawn agent work when a webhook event newly assigns an agent.
+// Optional; when omitted, webhook-initiated assignments land in the cache
+// but no task is queued.
+func (w *WebhookWorker) WithTaskEnqueuer(te TaskEnqueuer) *WebhookWorker {
+	if te != nil {
+		w.taskEnqueuer = te
+	}
+	return w
 }
 
 // Run starts the worker pool and blocks until ctx is cancelled.
@@ -105,10 +151,18 @@ func (w *WebhookWorker) processOne(ctx context.Context) (bool, error) {
 		return true, tx.Commit(ctx)
 	}
 
+	// Build a per-event Resolver bound to the transactional queries so
+	// reverse-resolution sees rows written by siblings in the same tx. The
+	// resolver never calls decrypt during reverse-lookup (only identity
+	// mapping tables are read), so the no-op decrypter is safe here.
+	resolver := NewResolver(q, w.decrypt)
+
 	deps := WebhookDeps{
-		Queries:     q,
-		WorkspaceID: row.WorkspaceID,
-		ProjectID:   conn.GitlabProjectID,
+		Queries:      q,
+		WorkspaceID:  row.WorkspaceID,
+		ProjectID:    conn.GitlabProjectID,
+		Resolver:     resolver,
+		TaskEnqueuer: w.taskEnqueuer,
 	}
 
 	if err := dispatchWebhookEvent(ctx, deps, row.EventType, row.Payload); err != nil {

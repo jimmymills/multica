@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -15,6 +16,8 @@ import (
 type resolverQueries interface {
 	GetWorkspaceGitlabConnection(ctx context.Context, workspaceID pgtype.UUID) (db.WorkspaceGitlabConnection, error)
 	GetUserGitlabConnection(ctx context.Context, arg db.GetUserGitlabConnectionParams) (db.UserGitlabConnection, error)
+	GetUserGitlabConnectionByGitlabUserID(ctx context.Context, arg db.GetUserGitlabConnectionByGitlabUserIDParams) (db.UserGitlabConnection, error)
+	GetGitlabProjectMember(ctx context.Context, arg db.GetGitlabProjectMemberParams) (db.GitlabProjectMember, error)
 }
 
 // Resolver picks the right GitLab token for a write request.
@@ -91,4 +94,49 @@ func (r *Resolver) ResolveTokenForWrite(ctx context.Context, workspaceID, actorT
 		return "", "", fmt.Errorf("resolver: decrypt service pat: %w", err)
 	}
 	return token, "service", nil
+}
+
+// ResolveMulticaUserFromGitlabUserID reverse-resolves a GitLab user ID to a
+// Multica user reference. Preference order:
+//  1. user_gitlab_connection — a human who connected their personal PAT is
+//     authoritative over a cached project-member row.
+//  2. gitlab_project_member  — GitLab user cached but no Multica mapping.
+//  3. Unmapped — returns all empty strings and a nil error; the caller
+//     decides how to handle it.
+//
+// Returns:
+//
+//	userType    — "member" | "gitlab_user" | ""
+//	userID      — Multica user UUID when userType="member", empty otherwise
+//	memberRowID — gitlab_project_member.id UUID when userType="gitlab_user",
+//	              empty otherwise
+func (r *Resolver) ResolveMulticaUserFromGitlabUserID(ctx context.Context, workspaceID string, gitlabUserID int64) (userType, userID, memberRowID string, err error) {
+	wsUUID, err := pgUUID(workspaceID)
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolver: workspace_id: %w", err)
+	}
+
+	conn, connErr := r.queries.GetUserGitlabConnectionByGitlabUserID(ctx, db.GetUserGitlabConnectionByGitlabUserIDParams{
+		WorkspaceID:  wsUUID,
+		GitlabUserID: gitlabUserID,
+	})
+	if connErr == nil {
+		return "member", util.UUIDToString(conn.UserID), "", nil
+	}
+	if !errors.Is(connErr, pgx.ErrNoRows) {
+		return "", "", "", fmt.Errorf("resolver: user connection lookup: %w", connErr)
+	}
+
+	member, memErr := r.queries.GetGitlabProjectMember(ctx, db.GetGitlabProjectMemberParams{
+		WorkspaceID:  wsUUID,
+		GitlabUserID: gitlabUserID,
+	})
+	if memErr == nil {
+		return "gitlab_user", "", util.UUIDToString(member.ID), nil
+	}
+	if !errors.Is(memErr, pgx.ErrNoRows) {
+		return "", "", "", fmt.Errorf("resolver: project member lookup: %w", memErr)
+	}
+
+	return "", "", "", nil
 }
