@@ -205,10 +205,19 @@ type CreateIssueRequest struct {
 // BuildCreateIssueInput converts a Multica create-issue request into the
 // GitLab REST body. agentSlugByUUID maps Multica agent UUID → slug so we
 // can express agent assignment as the agent::<slug> label.
+// memberGitlabUserIDByUUID maps Multica member UUID → GitLab user ID; the
+// caller resolves these via user_gitlab_connection before calling.
 //
-// Phase 3a behaviour: member assignees are dropped (no GitLab user mapping
-// yet — Phase 3b adds it). Agent assignees become the corresponding label.
-func BuildCreateIssueInput(req CreateIssueRequest, agentSlugByUUID map[string]string) gitlabapi.CreateIssueInput {
+// Phase 4 behaviour: agent assignees become the corresponding label;
+// member assignees resolve to GitLab user IDs via the caller-provided map.
+// Unmapped members (no PAT connection) are silently dropped — the cache
+// still records the member assignment, GitLab just won't reflect it until
+// the member connects their PAT.
+func BuildCreateIssueInput(
+	req CreateIssueRequest,
+	agentSlugByUUID map[string]string,
+	memberGitlabUserIDByUUID map[string]int64,
+) gitlabapi.CreateIssueInput {
 	labels := append([]string(nil), req.Labels...)
 	if req.Status != "" {
 		labels = append(labels, "status::"+req.Status)
@@ -221,12 +230,22 @@ func BuildCreateIssueInput(req CreateIssueRequest, agentSlugByUUID map[string]st
 			labels = append(labels, "agent::"+slug)
 		}
 	}
-	return gitlabapi.CreateIssueInput{
+	out := gitlabapi.CreateIssueInput{
 		Title:       req.Title,
 		Description: req.Description,
 		Labels:      labels,
 		DueDate:     req.DueDate,
 	}
+	// Member assignee: resolve to GitLab user ID via caller-provided map.
+	// Unmapped members (no PAT connection) are silently dropped — cache still
+	// stores the member assignment; GitLab just won't reflect it until the
+	// member connects their PAT (Phase 4 tolerates this inconsistency).
+	if req.AssigneeType == "member" && req.AssigneeID != "" {
+		if glID, ok := memberGitlabUserIDByUUID[req.AssigneeID]; ok {
+			out.AssigneeIDs = []int64{glID}
+		}
+	}
+	return out
 }
 
 // UpdateIssueRequest is the translator-facing input for PATCH /api/issues/{id}.
@@ -256,7 +275,22 @@ type OldIssueSnapshot struct {
 // and emits the GitLab-side update payload — add/remove labels for status,
 // priority, and agent-assignee changes; state_event for close/reopen; plus
 // pass-through of title/description/due_date when present.
-func BuildUpdateIssueInput(old OldIssueSnapshot, req UpdateIssueRequest, agentSlugByUUID map[string]string) gitlabapi.UpdateIssueInput {
+//
+// memberGitlabUserIDByUUID maps Multica member UUID → GitLab user ID for
+// resolving member assignees on outbound updates. Unmapped members leave
+// AssigneeIDs nil (don't touch GitLab), relying on the cache to record the
+// assignment locally.
+//
+// AssigneeIDs semantics on the output:
+//   - nil           → "don't touch assignees on GitLab"
+//   - &[]int64{}    → "clear all assignees on GitLab"
+//   - &[]int64{7}   → "set assignees to [7]"
+func BuildUpdateIssueInput(
+	old OldIssueSnapshot,
+	req UpdateIssueRequest,
+	agentSlugByUUID map[string]string,
+	memberGitlabUserIDByUUID map[string]int64,
+) gitlabapi.UpdateIssueInput {
 	out := gitlabapi.UpdateIssueInput{
 		Title:       req.Title,
 		Description: req.Description,
@@ -318,6 +352,29 @@ func BuildUpdateIssueInput(old OldIssueSnapshot, req UpdateIssueRequest, agentSl
 			if newAgentSlug != "" {
 				out.AddLabels = append(out.AddLabels, "agent::"+newAgentSlug)
 			}
+		}
+	}
+
+	// Member assignee transitions. AssigneeIDs is *[]int64:
+	//   - nil        → don't touch GitLab assignees
+	//   - &[]int64{} → explicit clear
+	//   - &[]int64{n}→ set to that user
+	// Agent transitions are handled via the label path above; leave
+	// AssigneeIDs nil for those.
+	if req.AssigneeType != nil {
+		switch {
+		case *req.AssigneeType == "":
+			// Explicit clear: caller is unassigning. Tell GitLab to drop
+			// all assignees.
+			empty := []int64{}
+			out.AssigneeIDs = &empty
+		case *req.AssigneeType == "member" && req.AssigneeID != nil && *req.AssigneeID != "":
+			if glID, ok := memberGitlabUserIDByUUID[*req.AssigneeID]; ok {
+				ids := []int64{glID}
+				out.AssigneeIDs = &ids
+			}
+			// Unmapped member: leave AssigneeIDs nil. Handler's cache-only
+			// fallback preserves the member assignment in the cache row.
 		}
 	}
 

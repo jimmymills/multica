@@ -941,7 +941,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 				Priority:     priority,
 				AssigneeType: assigneeTypeStr,
 				AssigneeID:   assigneeIDStr,
-			}, agentSlugMap)
+			}, agentSlugMap, nil)
 
 			glIssue, err := h.Gitlab.CreateIssue(r.Context(), token, wsConn.GitlabProjectID, glInput)
 			if err != nil {
@@ -1443,7 +1443,7 @@ func (h *Handler) updateSingleIssueWriteThrough(
 			clear.DueDate = true
 		}
 	}
-	glInput := gitlabsync.BuildUpdateIssueInput(oldSnap, translatorReq, agentSlugByUUID)
+	glInput := gitlabsync.BuildUpdateIssueInput(oldSnap, translatorReq, agentSlugByUUID, nil)
 
 	if !prevIssue.GitlabIid.Valid || !prevIssue.GitlabProjectID.Valid {
 		// Defensive: a cache row on a GitLab-connected workspace that

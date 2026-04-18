@@ -261,7 +261,7 @@ func TestBuildCreateIssueInput_StatusAndPriorityToLabels(t *testing.T) {
 		Status:   "in_progress",
 		Priority: "high",
 	}
-	out := BuildCreateIssueInput(in, nil)
+	out := BuildCreateIssueInput(in, nil, nil)
 	if out.Title != "hi" {
 		t.Errorf("title = %q", out.Title)
 	}
@@ -291,7 +291,7 @@ func TestBuildCreateIssueInput_AgentAssigneeToLabel(t *testing.T) {
 		AssigneeType: "agent",
 		AssigneeID:   "agent-uuid-1",
 	}
-	out := BuildCreateIssueInput(in, map[string]string{"agent-uuid-1": "builder"})
+	out := BuildCreateIssueInput(in, map[string]string{"agent-uuid-1": "builder"}, nil)
 	hasAgentLabel := false
 	for _, l := range out.Labels {
 		if l == "agent::builder" {
@@ -306,22 +306,6 @@ func TestBuildCreateIssueInput_AgentAssigneeToLabel(t *testing.T) {
 	}
 }
 
-func TestBuildCreateIssueInput_MemberAssigneeIgnoredInPhase3a(t *testing.T) {
-	// Phase 3b will resolve member UUID → GitLab user ID. Until then,
-	// member assignees are silently dropped.
-	in := CreateIssueRequest{
-		Title:        "hi",
-		Status:       "todo",
-		Priority:     "none",
-		AssigneeType: "member",
-		AssigneeID:   "user-uuid-1",
-	}
-	out := BuildCreateIssueInput(in, nil)
-	if len(out.AssigneeIDs) != 0 {
-		t.Errorf("AssigneeIDs should be empty for member assignee in 3a, got %v", out.AssigneeIDs)
-	}
-}
-
 func TestBuildCreateIssueInput_PriorityNoneOmitted(t *testing.T) {
 	// priority::none is the default — emitting the label clutters GitLab UI.
 	in := CreateIssueRequest{
@@ -329,11 +313,97 @@ func TestBuildCreateIssueInput_PriorityNoneOmitted(t *testing.T) {
 		Status:   "todo",
 		Priority: "none",
 	}
-	out := BuildCreateIssueInput(in, nil)
+	out := BuildCreateIssueInput(in, nil, nil)
 	for _, l := range out.Labels {
 		if l == "priority::none" {
 			t.Errorf("priority::none should not be emitted as a label; got %v", out.Labels)
 		}
+	}
+}
+
+func TestBuildCreateIssueInput_MemberAssigneeResolvesToGitlabUserID(t *testing.T) {
+	memberByUUID := map[string]int64{
+		"11111111-1111-1111-1111-111111111111": 7,
+	}
+	req := CreateIssueRequest{
+		Title:        "T",
+		AssigneeType: "member",
+		AssigneeID:   "11111111-1111-1111-1111-111111111111",
+	}
+	out := BuildCreateIssueInput(req, nil, memberByUUID)
+	if len(out.AssigneeIDs) != 1 || out.AssigneeIDs[0] != 7 {
+		t.Errorf("AssigneeIDs = %v, want [7]", out.AssigneeIDs)
+	}
+}
+
+func TestBuildCreateIssueInput_UnmappedMemberDoesNotSendAssignee(t *testing.T) {
+	req := CreateIssueRequest{AssigneeType: "member", AssigneeID: "99999999-9999-9999-9999-999999999999"}
+	out := BuildCreateIssueInput(req, nil, map[string]int64{})
+	if len(out.AssigneeIDs) != 0 {
+		t.Errorf("AssigneeIDs should be empty for unmapped member, got %v", out.AssigneeIDs)
+	}
+}
+
+func TestBuildCreateIssueInput_AgentAssigneeDoesNotSetGitlabAssignees(t *testing.T) {
+	// Regression guard: agent always goes via label, never native assignee_ids.
+	req := CreateIssueRequest{AssigneeType: "agent", AssigneeID: "some-agent-uuid"}
+	out := BuildCreateIssueInput(req, map[string]string{"some-agent-uuid": "builder"}, map[string]int64{})
+	if len(out.AssigneeIDs) != 0 {
+		t.Errorf("agent assignee must not set AssigneeIDs, got %v", out.AssigneeIDs)
+	}
+}
+
+func TestBuildUpdateIssueInput_MemberAssigneeResolvesToGitlabUserID(t *testing.T) {
+	memberByUUID := map[string]int64{
+		"11111111-1111-1111-1111-111111111111": 7,
+	}
+	assigneeType := "member"
+	assigneeID := "11111111-1111-1111-1111-111111111111"
+	req := UpdateIssueRequest{AssigneeType: &assigneeType, AssigneeID: &assigneeID}
+	old := OldIssueSnapshot{} // no prior assignee
+	out := BuildUpdateIssueInput(old, req, nil, memberByUUID)
+	if out.AssigneeIDs == nil {
+		t.Fatal("AssigneeIDs should be set for member assignee")
+	}
+	if len(*out.AssigneeIDs) != 1 || (*out.AssigneeIDs)[0] != 7 {
+		t.Errorf("AssigneeIDs = %v, want [7]", *out.AssigneeIDs)
+	}
+}
+
+func TestBuildUpdateIssueInput_ExplicitClearSendsEmptySlice(t *testing.T) {
+	clearType := ""
+	clearID := ""
+	req := UpdateIssueRequest{AssigneeType: &clearType, AssigneeID: &clearID}
+	old := OldIssueSnapshot{AssigneeType: "member", AssigneeUUID: "11111111-1111-1111-1111-111111111111"}
+	out := BuildUpdateIssueInput(old, req, nil, map[string]int64{"11111111-1111-1111-1111-111111111111": 7})
+	if out.AssigneeIDs == nil {
+		t.Fatal("AssigneeIDs should be &[] (not nil) for explicit clear")
+	}
+	if len(*out.AssigneeIDs) != 0 {
+		t.Errorf("want empty slice for clear, got %v", *out.AssigneeIDs)
+	}
+}
+
+func TestBuildUpdateIssueInput_NoAssigneeChangeLeavesAssigneeIDsNil(t *testing.T) {
+	// PATCH of title only — don't touch assignees.
+	title := "new title"
+	req := UpdateIssueRequest{Title: &title}
+	old := OldIssueSnapshot{AssigneeType: "member", AssigneeUUID: "11111111-1111-1111-1111-111111111111"}
+	out := BuildUpdateIssueInput(old, req, nil, map[string]int64{"11111111-1111-1111-1111-111111111111": 7})
+	if out.AssigneeIDs != nil {
+		t.Errorf("AssigneeIDs should stay nil when no assignee change, got %v", *out.AssigneeIDs)
+	}
+}
+
+func TestBuildUpdateIssueInput_UnmappedMemberLeavesAssigneeIDsNil(t *testing.T) {
+	// Member without user_gitlab_connection — translator doesn't know
+	// the gitlab user ID, so it drops the assignee (cache-only).
+	assigneeType := "member"
+	assigneeID := "99999999-9999-9999-9999-999999999999"
+	req := UpdateIssueRequest{AssigneeType: &assigneeType, AssigneeID: &assigneeID}
+	out := BuildUpdateIssueInput(OldIssueSnapshot{}, req, nil, map[string]int64{})
+	if out.AssigneeIDs != nil {
+		t.Errorf("unmapped member — AssigneeIDs should be nil, got %v", *out.AssigneeIDs)
 	}
 }
 
@@ -471,6 +541,7 @@ func TestBuildUpdateIssueInput(t *testing.T) {
 				},
 				tc.req,
 				agentSlugByUUID,
+				nil,
 			)
 			if !strSliceEq(got.AddLabels, tc.wantAddLabels) {
 				t.Errorf("AddLabels = %v, want %v", got.AddLabels, tc.wantAddLabels)
