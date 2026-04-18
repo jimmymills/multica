@@ -328,11 +328,11 @@ func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, secretsCi
 
 			// Comments
 			r.Route("/api/comments/{commentId}", func(r chi.Router) {
-				r.Use(middleware.GitlabWritesBlocked(queries))
-				r.Put("/", h.UpdateComment)
-				r.Delete("/", h.DeleteComment)
-				r.Post("/reactions", h.AddReaction)
-				r.Delete("/reactions", h.RemoveReaction)
+				gw := middleware.GitlabWritesBlocked(queries)
+				r.Put("/", h.UpdateComment)          // unmounted (Phase 3c)
+				r.Delete("/", h.DeleteComment)       // unmounted (Phase 3c)
+				r.With(gw).Post("/reactions", h.AddReaction)       // 501 (Phase 3d)
+				r.With(gw).Delete("/reactions", h.RemoveReaction)  // 501 (Phase 3d)
 			})
 
 			// Agents
