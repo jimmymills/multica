@@ -70,3 +70,225 @@ func TestReconciler_PicksUpDriftAndAdvancesCursor(t *testing.T) {
 		t.Errorf("last_sync_cursor = %+v, want %v", conn.LastSyncCursor, expected)
 	}
 }
+
+// TestReconciler_SweepDeletesOrphanedCacheRow asserts the deletion sweep
+// tears down cache rows whose GitLab counterpart has been destroyed (project
+// webhooks don't fire on destroy, so without this sweep deleted issues
+// linger indefinitely). Two cached issues, GitLab list only returns one, a
+// per-issue GET on the missing one returns 404 → the orphan gets swept.
+func TestReconciler_SweepDeletesOrphanedCacheRow(t *testing.T) {
+	pool := connectTestPool(t)
+	wsID := makeWorkspace(t, pool)
+	wsUUID := mustPGUUID(t, wsID)
+	queries := db.New(pool)
+
+	// Seed two cache rows. IID=100 will survive; IID=200 is the orphan.
+	// Direct INSERT (not UpsertIssueFromGitlab) so we can set number
+	// explicitly — the sqlc upsert doesn't take number and relies on the
+	// DB default of 0, which collides on the second row under
+	// uq_issue_workspace_number.
+	for i, iid := range []int32{100, 200} {
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO issue (workspace_id, title, status, priority, number,
+			                   gitlab_iid, gitlab_project_id, external_updated_at)
+			VALUES ($1, 'seeded', 'todo', 'none', $2, $3, 700, '2026-04-17T09:00:00Z')
+		`, wsID, i+1, iid); err != nil {
+			t.Fatalf("seed iid=%d: %v", iid, err)
+		}
+	}
+
+	// GitLab list returns only IID=100. A per-issue GET on IID=200 returns
+	// 404 → confirmed destroyed, sweep deletes it.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v4/projects/700/issues":
+			json.NewEncoder(w).Encode([]gitlabapi.Issue{
+				{ID: 1, IID: 100, Title: "still exists", State: "opened", UpdatedAt: "2026-04-17T10:00:00Z"},
+			})
+		case "/api/v4/projects/700/issues/200":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"404 Not found"}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	del := &recordingDeleter{}
+	r := NewReconciler(queries, gitlabapi.NewClient(srv.URL, srv.Client()),
+		func(ctx context.Context, encrypted []byte) (string, error) { return "tok", nil }).
+		WithIssueDeleter(del)
+
+	if err := r.sweepDeletions(context.Background(), db.WorkspaceGitlabConnection{
+		WorkspaceID:     wsUUID,
+		GitlabProjectID: 700,
+	}, "tok"); err != nil {
+		t.Fatalf("sweepDeletions: %v", err)
+	}
+
+	if got := del.callCount(); got != 1 {
+		t.Fatalf("CleanupAndDeleteIssue calls = %d, want 1", got)
+	}
+	orphan, err := queries.GetIssueByGitlabIID(context.Background(), db.GetIssueByGitlabIIDParams{
+		WorkspaceID: wsUUID,
+		GitlabIid:   pgtype.Int4{Int32: 200, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("orphan row lookup: %v", err)
+	}
+	if del.calls[0] != uuidString(orphan.ID) {
+		t.Errorf("swept issue_id = %q, want %q (the orphan)", del.calls[0], uuidString(orphan.ID))
+	}
+}
+
+// TestReconciler_SweepWipesGenuinelyEmptyProject asserts that an empty
+// project whose cache still holds rows DOES get swept — provided each orphan
+// is confirmed destroyed via a per-issue 404. This is the case we hit when
+// a user deletes every test issue on gitlab.com: the earlier list-length
+// guard used to refuse this and strand stale rows forever.
+func TestReconciler_SweepWipesGenuinelyEmptyProject(t *testing.T) {
+	pool := connectTestPool(t)
+	wsID := makeWorkspace(t, pool)
+	wsUUID := mustPGUUID(t, wsID)
+	queries := db.New(pool)
+
+	for i, iid := range []int32{401, 402} {
+		if _, err := pool.Exec(context.Background(), `
+			INSERT INTO issue (workspace_id, title, status, priority, number,
+			                   gitlab_iid, gitlab_project_id, external_updated_at)
+			VALUES ($1, 'seeded', 'todo', 'none', $2, $3, 702, '2026-04-17T09:00:00Z')
+		`, wsID, i+1, iid); err != nil {
+			t.Fatalf("seed iid=%d: %v", iid, err)
+		}
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v4/projects/702/issues":
+			json.NewEncoder(w).Encode([]gitlabapi.Issue{})
+		case "/api/v4/projects/702/issues/401", "/api/v4/projects/702/issues/402":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"404 Not found"}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	del := &recordingDeleter{}
+	r := NewReconciler(queries, gitlabapi.NewClient(srv.URL, srv.Client()),
+		func(ctx context.Context, encrypted []byte) (string, error) { return "tok", nil }).
+		WithIssueDeleter(del)
+
+	if err := r.sweepDeletions(context.Background(), db.WorkspaceGitlabConnection{
+		WorkspaceID:     wsUUID,
+		GitlabProjectID: 702,
+	}, "tok"); err != nil {
+		t.Fatalf("sweepDeletions: %v", err)
+	}
+
+	if got := del.callCount(); got != 2 {
+		t.Fatalf("CleanupAndDeleteIssue calls = %d, want 2 (both orphans confirmed 404)", got)
+	}
+}
+
+// TestReconciler_SweepSkipsOrphanWhenGetStillExists asserts the self-healing
+// guard: the list response can be stale/inconsistent (GitLab's search index
+// catching up), but a targeted GET is authoritative. If the per-issue check
+// returns the issue, we do NOT delete — just skip this tick and try again.
+func TestReconciler_SweepSkipsOrphanWhenGetStillExists(t *testing.T) {
+	pool := connectTestPool(t)
+	wsID := makeWorkspace(t, pool)
+	wsUUID := mustPGUUID(t, wsID)
+	queries := db.New(pool)
+
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO issue (workspace_id, title, status, priority, number,
+		                   gitlab_iid, gitlab_project_id, external_updated_at)
+		VALUES ($1, 'seeded', 'todo', 'none', 1, 500, 703, '2026-04-17T09:00:00Z')
+	`, wsID); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v4/projects/703/issues":
+			// List says empty — but the issue actually exists.
+			json.NewEncoder(w).Encode([]gitlabapi.Issue{})
+		case "/api/v4/projects/703/issues/500":
+			json.NewEncoder(w).Encode(gitlabapi.Issue{
+				ID: 500, IID: 500, Title: "still here", State: "opened", UpdatedAt: "2026-04-17T10:00:00Z",
+			})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	del := &recordingDeleter{}
+	r := NewReconciler(queries, gitlabapi.NewClient(srv.URL, srv.Client()),
+		func(ctx context.Context, encrypted []byte) (string, error) { return "tok", nil }).
+		WithIssueDeleter(del)
+
+	if err := r.sweepDeletions(context.Background(), db.WorkspaceGitlabConnection{
+		WorkspaceID:     wsUUID,
+		GitlabProjectID: 703,
+	}, "tok"); err != nil {
+		t.Fatalf("sweepDeletions: %v", err)
+	}
+
+	if got := del.callCount(); got != 0 {
+		t.Fatalf("CleanupAndDeleteIssue calls = %d, want 0 (GET confirmed existence)", got)
+	}
+}
+
+// TestReconciler_SweepSkipsOrphanOnGetTransientError asserts that a
+// non-404 error from the per-issue GET (403, 5xx, etc.) does NOT delete the
+// row. We only act on an authoritative 404.
+func TestReconciler_SweepSkipsOrphanOnGetTransientError(t *testing.T) {
+	pool := connectTestPool(t)
+	wsID := makeWorkspace(t, pool)
+	wsUUID := mustPGUUID(t, wsID)
+	queries := db.New(pool)
+
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO issue (workspace_id, title, status, priority, number,
+		                   gitlab_iid, gitlab_project_id, external_updated_at)
+		VALUES ($1, 'seeded', 'todo', 'none', 1, 600, 704, '2026-04-17T09:00:00Z')
+	`, wsID); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v4/projects/704/issues":
+			json.NewEncoder(w).Encode([]gitlabapi.Issue{})
+		case "/api/v4/projects/704/issues/600":
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"gitlab boom"}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	del := &recordingDeleter{}
+	r := NewReconciler(queries, gitlabapi.NewClient(srv.URL, srv.Client()),
+		func(ctx context.Context, encrypted []byte) (string, error) { return "tok", nil }).
+		WithIssueDeleter(del)
+
+	if err := r.sweepDeletions(context.Background(), db.WorkspaceGitlabConnection{
+		WorkspaceID:     wsUUID,
+		GitlabProjectID: 704,
+	}, "tok"); err != nil {
+		t.Fatalf("sweepDeletions: %v", err)
+	}
+
+	if got := del.callCount(); got != 0 {
+		t.Fatalf("CleanupAndDeleteIssue calls = %d, want 0 (non-404 must skip)", got)
+	}
+}
