@@ -16,9 +16,16 @@ import (
 )
 
 // SyncDeps is the set of plumbing the sync orchestrator needs.
+//
+// Resolver is optional: when non-nil, the sync reverse-resolves GitLab user
+// IDs on notes, awards, and issue assignees to Multica member UUIDs (or
+// gitlab_project_member rows for unconnected users). When nil, the sync
+// leaves Multica author/actor/assignee columns NULL and preserves only the
+// raw gitlab_*_user_id hint.
 type SyncDeps struct {
-	Queries *db.Queries
-	Client  *gitlabapi.Client
+	Queries  *db.Queries
+	Client   *gitlabapi.Client
+	Resolver *Resolver
 }
 
 // RunInitialSyncInput is the per-call input.
@@ -191,7 +198,29 @@ func syncOneIssue(
 ) error {
 	values := TranslateIssue(issue, &TranslateContext{AgentBySlug: agentMap})
 
-	row, err := deps.Queries.UpsertIssueFromGitlab(ctx, buildUpsertIssueParams(wsUUID, in.ProjectID, issue, values))
+	// Reverse-resolve native GitLab assignee to a Multica member (or cached
+	// gitlab_project_member row) when no agent::<slug> label won the slot.
+	if values.AssigneeType == "" && values.GitlabAssigneeUserID != 0 && deps.Resolver != nil {
+		ut, uid, memID, rErr := deps.Resolver.ResolveMulticaUserFromGitlabUserID(ctx, uuidString(wsUUID), values.GitlabAssigneeUserID)
+		if rErr != nil {
+			return fmt.Errorf("resolve assignee: %w", rErr)
+		}
+		switch ut {
+		case "member":
+			values.AssigneeType = "member"
+			values.AssigneeID = uid
+		case "gitlab_user":
+			values.AssigneeType = "gitlab_user"
+			values.AssigneeID = memID
+		}
+	}
+
+	creatorType, creatorID, err := resolveCreatorFromGitlabID(ctx, deps.Resolver, uuidString(wsUUID), values.CreatorGitlabUserID)
+	if err != nil {
+		return fmt.Errorf("resolve creator: %w", err)
+	}
+
+	row, err := deps.Queries.UpsertIssueFromGitlab(ctx, buildUpsertIssueParams(wsUUID, in.ProjectID, issue, values, creatorType, creatorID))
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("upsert issue: %w", err)
@@ -242,6 +271,18 @@ func syncOneIssue(
 				authorType = pgtype.Text{String: "agent", Valid: true}
 				_ = authorID.Scan(uuidStr)
 			}
+		} else if nv.GitlabUserID != 0 && deps.Resolver != nil {
+			// Human-authored note: reverse-resolve to a Multica member
+			// when possible. comment.author_type only accepts 'member' or
+			// 'agent', so unmapped GitLab users leave NULL refs.
+			ut, uid, _, rErr := deps.Resolver.ResolveMulticaUserFromGitlabUserID(ctx, uuidString(wsUUID), nv.GitlabUserID)
+			if rErr != nil {
+				return fmt.Errorf("resolve note author: %w", rErr)
+			}
+			if ut == "member" {
+				authorType = pgtype.Text{String: "member", Valid: true}
+				_ = authorID.Scan(uid)
+			}
 		}
 		var glUser pgtype.Int8
 		if nv.GitlabUserID != 0 {
@@ -264,14 +305,27 @@ func syncOneIssue(
 		}
 	}
 
-	// Awards — sync all. Multica actor refs NULL until Phase 3 wires
-	// gitlab user → multica member; gitlab_actor_user_id always populated.
+	// Awards — sync all. Reverse-resolve the actor the same way we do for
+	// notes: member when mapped, NULL otherwise (issue_reaction.actor_type
+	// only permits 'member' / 'agent').
 	awards, err := deps.Client.ListAwardEmoji(ctx, in.Token, in.ProjectID, issue.IID)
 	if err != nil {
 		return fmt.Errorf("list awards: %w", err)
 	}
 	for _, a := range awards {
 		av := TranslateAward(a)
+		var actorType pgtype.Text
+		var actorID pgtype.UUID
+		if av.GitlabUserID != 0 && deps.Resolver != nil {
+			ut, uid, _, rErr := deps.Resolver.ResolveMulticaUserFromGitlabUserID(ctx, uuidString(wsUUID), av.GitlabUserID)
+			if rErr != nil {
+				return fmt.Errorf("resolve award actor: %w", rErr)
+			}
+			if ut == "member" {
+				actorType = pgtype.Text{String: "member", Valid: true}
+				_ = actorID.Scan(uid)
+			}
+		}
 		var glUser pgtype.Int8
 		if av.GitlabUserID != 0 {
 			glUser = pgtype.Int8{Int64: av.GitlabUserID, Valid: true}
@@ -279,8 +333,8 @@ func syncOneIssue(
 		if _, err := deps.Queries.UpsertIssueReactionFromGitlab(ctx, db.UpsertIssueReactionFromGitlabParams{
 			WorkspaceID:       wsUUID,
 			IssueID:           row.ID,
-			ActorType:         pgtype.Text{},
-			ActorID:           pgtype.UUID{},
+			ActorType:         actorType,
+			ActorID:           actorID,
 			GitlabActorUserID: glUser,
 			Emoji:             av.Emoji,
 			GitlabAwardID:     pgtype.Int8{Int64: a.ID, Valid: true},
@@ -295,12 +349,22 @@ func syncOneIssue(
 
 // buildUpsertIssueParams converts a translated IssueValues + raw GitLab issue
 // into the sqlc params struct.
-func buildUpsertIssueParams(wsUUID pgtype.UUID, projectID int64, issue gitlabapi.Issue, values IssueValues) db.UpsertIssueFromGitlabParams {
+//
+// creatorType/creatorID are resolved by the caller (webhook handler or
+// initial sync) — only 'member' is valid per the issue.creator_type CHECK
+// constraint; pass ("", "") when unmapped or unknown.
+func buildUpsertIssueParams(wsUUID pgtype.UUID, projectID int64, issue gitlabapi.Issue, values IssueValues, creatorType, creatorID string) db.UpsertIssueFromGitlabParams {
 	var assigneeType pgtype.Text
 	var assigneeID pgtype.UUID
 	if values.AssigneeType != "" {
 		assigneeType = pgtype.Text{String: values.AssigneeType, Valid: true}
 		_ = assigneeID.Scan(values.AssigneeID)
+	}
+	var creatorTypeT pgtype.Text
+	var creatorIDU pgtype.UUID
+	if creatorType != "" && creatorID != "" {
+		creatorTypeT = pgtype.Text{String: creatorType, Valid: true}
+		_ = creatorIDU.Scan(creatorID)
 	}
 	desc := pgtype.Text{}
 	if values.Description != "" {
@@ -317,11 +381,29 @@ func buildUpsertIssueParams(wsUUID pgtype.UUID, projectID int64, issue gitlabapi
 		Priority:          values.Priority,
 		AssigneeType:      assigneeType,
 		AssigneeID:        assigneeID,
-		CreatorType:       pgtype.Text{}, // NULL — Phase 3 populates
-		CreatorID:         pgtype.UUID{}, // NULL — Phase 3 populates
+		CreatorType:       creatorTypeT,
+		CreatorID:         creatorIDU,
 		DueDate:           parseTS(values.DueDate),
 		ExternalUpdatedAt: parseTS(values.UpdatedAt),
 	}
+}
+
+// resolveCreatorFromGitlabID reverse-resolves the issue author's GitLab user
+// ID to a Multica member. Returns ("", "") for unmapped users — the
+// issue.creator_type CHECK constraint rejects 'gitlab_user', so only 'member'
+// is valid here; unmapped creators leave the columns NULL.
+func resolveCreatorFromGitlabID(ctx context.Context, resolver *Resolver, workspaceID string, gitlabUserID int64) (string, string, error) {
+	if resolver == nil || gitlabUserID == 0 {
+		return "", "", nil
+	}
+	ut, uid, _, err := resolver.ResolveMulticaUserFromGitlabUserID(ctx, workspaceID, gitlabUserID)
+	if err != nil {
+		return "", "", err
+	}
+	if ut == "member" {
+		return "member", uid, nil
+	}
+	return "", "", nil
 }
 
 // buildAgentSlugMap loads slug→uuid for every agent in the workspace.

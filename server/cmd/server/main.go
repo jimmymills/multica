@@ -128,12 +128,15 @@ func main() {
 
 	if gitlabEnabled {
 		glQueries := db.New(pool)
-		// Webhook worker pool — drains gitlab_webhook_event into the cache.
-		webhookWorker := gitlabsync.NewWebhookWorker(glQueries, pool, 5, 250*time.Millisecond)
-		go webhookWorker.Run(serverCtx)
-
-		// Shared decrypter for the reconciler.
+		// Shared decrypter for the reconciler + webhook worker (the latter
+		// only uses it as a safety net — reverse-resolution reads unencrypted
+		// identity-mapping tables and doesn't call decrypt).
 		decrypter := gitlabsync.NewCipherDecrypter(secretsCipher)
+
+		// Webhook worker pool — drains gitlab_webhook_event into the cache.
+		webhookWorker := gitlabsync.NewWebhookWorker(glQueries, pool, 5, 250*time.Millisecond).
+			WithDecrypter(decrypter)
+		go webhookWorker.Run(serverCtx)
 
 		// Reconciler — 5-minute drift catcher.
 		reconciler := gitlabsync.NewReconciler(glQueries, gitlabClient, decrypter)
