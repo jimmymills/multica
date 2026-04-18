@@ -734,6 +734,22 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	// Sanitize HTML to prevent stored XSS.
 	req.Content = sanitize.HTML(req.Content)
 
+	// Phase 3c write-through: when the workspace has a GitLab connection AND
+	// the comment is GitLab-backed (gitlab_note_id + parent issue has
+	// gitlab_iid + gitlab_project_id), PUT the new body to GitLab first, then
+	// upsert the cache row from the returned representation. Falls through
+	// to the legacy direct-DB path only when no connection exists; a
+	// connected workspace with a local-only comment/parent issue is a
+	// data-integrity error and returns 502.
+	if h.GitlabEnabled && h.GitlabResolver != nil {
+		_, wsErr := h.Queries.GetWorkspaceGitlabConnection(r.Context(), existing.WorkspaceID)
+		if wsErr == nil {
+			h.updateCommentWriteThrough(w, r, existing, req.Content, actorType, actorID, workspaceID, commentId)
+			return
+		}
+		// err != nil → fall through to legacy path (non-connected workspace).
+	}
+
 	comment, err := h.Queries.UpdateComment(r.Context(), db.UpdateCommentParams{
 		ID:      parseUUID(commentId),
 		Content: req.Content,
@@ -750,6 +766,149 @@ func (h *Handler) UpdateComment(w http.ResponseWriter, r *http.Request) {
 	cid := uuidToString(comment.ID)
 	resp := commentToResponse(comment, grouped[cid], groupedAtt[cid])
 	slog.Info("comment updated", append(logger.RequestAttrs(r), "comment_id", commentId)...)
+	h.publish(protocol.EventCommentUpdated, workspaceID, actorType, actorID, map[string]any{"comment": resp})
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// updateCommentWriteThrough implements the Phase 3c write-through branch of
+// PUT /api/comments/{commentId}: PUT the new body to GitLab, then upsert the
+// cache row from the returned representation.
+//
+// Agent-authored comments preserve the canonical "**[agent:<slug>]** " body
+// prefix — derived from the CURRENT cache row's author_type/author_id, not
+// the request actor. A project admin editing someone else's comment doesn't
+// change authorship (GitLab's PUT notes endpoint will typically 403 a
+// cross-author edit via user PAT anyway — we propagate that as 502).
+//
+// On GitLab error returns a non-2xx status and aborts — we must NOT fall
+// through to the legacy path, which would diverge the cache from GitLab.
+func (h *Handler) updateCommentWriteThrough(
+	w http.ResponseWriter,
+	r *http.Request,
+	existing db.Comment,
+	newContent string,
+	actorType, actorID, workspaceID, commentId string,
+) {
+	ctx := r.Context()
+
+	// Data-integrity check: connected workspace + local-only comment or
+	// parent issue is a 502, not silent divergence.
+	if !existing.GitlabNoteID.Valid {
+		slog.Error("gitlab connected workspace but comment has no gitlab_note_id",
+			"comment_id", commentId, "workspace_id", workspaceID)
+		writeError(w, http.StatusBadGateway, "comment not linked to gitlab")
+		return
+	}
+	issue, issueErr := h.Queries.GetIssue(ctx, existing.IssueID)
+	if issueErr != nil {
+		slog.Error("load parent issue for gitlab comment update", "error", issueErr, "comment_id", commentId)
+		writeError(w, http.StatusInternalServerError, "failed to update comment")
+		return
+	}
+	if !issue.GitlabIid.Valid || !issue.GitlabProjectID.Valid {
+		slog.Error("gitlab connected workspace but parent issue has no gitlab refs",
+			"comment_id", commentId, "issue_id", uuidToString(existing.IssueID))
+		writeError(w, http.StatusBadGateway, "issue not linked to gitlab")
+		return
+	}
+
+	token, _, err := h.GitlabResolver.ResolveTokenForWrite(ctx, workspaceID, actorType, actorID)
+	if err != nil {
+		slog.Error("resolve gitlab token", "error", err, "workspace_id", workspaceID)
+		writeError(w, http.StatusBadGateway, "could not resolve gitlab token")
+		return
+	}
+
+	// Preserve the existing agent prefix so round-tripping through GitLab
+	// + webhook replay keeps authorship intact. The prefix is determined by
+	// the CURRENT cache row's author_type/author_id, not the request actor
+	// (admins editing an agent comment must still emit the agent prefix).
+	existingAuthorType := ""
+	if existing.AuthorType.Valid {
+		existingAuthorType = existing.AuthorType.String
+	}
+	var existingAgentSlug string
+	if existingAuthorType == "agent" && existing.AuthorID.Valid {
+		agentMap, err := h.buildAgentUUIDSlugMap(ctx, existing.WorkspaceID)
+		if err != nil {
+			slog.Error("agent slug map", "error", err, "workspace_id", workspaceID)
+			writeError(w, http.StatusInternalServerError, "build agent map failed")
+			return
+		}
+		existingAgentSlug = agentMap[uuidToString(existing.AuthorID)]
+	}
+
+	glBody := gitlabsync.BuildCreateNoteBody(existingAuthorType, existingAgentSlug, newContent)
+
+	glNote, err := h.Gitlab.UpdateNote(ctx,
+		token,
+		issue.GitlabProjectID.Int64,
+		int(issue.GitlabIid.Int32),
+		existing.GitlabNoteID.Int64,
+		glBody,
+	)
+	if err != nil {
+		slog.Error("gitlab update note", "error", err, "comment_id", commentId)
+		writeError(w, http.StatusBadGateway, "gitlab update note failed")
+		return
+	}
+
+	nv := gitlabsync.TranslateNote(*glNote)
+
+	// Author resolution preserves the existing cache row's Multica actor
+	// refs — an admin editing someone else's comment must not flip the
+	// author. Only gitlab_author_user_id and content are refreshed.
+	var glAuthor pgtype.Int8
+	if nv.GitlabUserID != 0 {
+		glAuthor = pgtype.Int8{Int64: nv.GitlabUserID, Valid: true}
+	} else if glNote.Author.ID != 0 {
+		glAuthor = pgtype.Int8{Int64: glNote.Author.ID, Valid: true}
+	} else {
+		glAuthor = existing.GitlabAuthorUserID
+	}
+
+	externalUpdatedAt := parseGitlabTS(nv.UpdatedAt)
+
+	upsertParams := db.UpsertCommentFromGitlabParams{
+		WorkspaceID:        existing.WorkspaceID,
+		IssueID:            existing.IssueID,
+		AuthorType:         existing.AuthorType,
+		AuthorID:           existing.AuthorID,
+		GitlabAuthorUserID: glAuthor,
+		Content:            nv.Body,
+		Type:               nv.Type,
+		GitlabNoteID:       pgtype.Int8{Int64: glNote.ID, Valid: true},
+		ExternalUpdatedAt:  externalUpdatedAt,
+	}
+	cacheRow, upErr := h.Queries.UpsertCommentFromGitlab(ctx, upsertParams)
+	if upErr != nil {
+		if errors.Is(upErr, pgx.ErrNoRows) {
+			// Clobber guard short-circuited: a concurrent webhook wrote a
+			// newer-or-equal row. Load the existing cache copy and return
+			// 200 with it — matches the POST write-through and webhook
+			// handler's tolerance for this race.
+			loaded, loadErr := h.Queries.GetCommentByGitlabNoteID(ctx,
+				pgtype.Int8{Int64: glNote.ID, Valid: true})
+			if loadErr != nil {
+				slog.Error("load comment after clobber-guard short-circuit",
+					"error", loadErr, "gitlab_note_id", glNote.ID)
+				writeError(w, http.StatusInternalServerError, "failed to update comment")
+				return
+			}
+			cacheRow = loaded
+		} else {
+			slog.Error("upsert gitlab comment cache row", "error", upErr)
+			writeError(w, http.StatusInternalServerError, "cache upsert failed")
+			return
+		}
+	}
+
+	grouped := h.groupReactions(r, []pgtype.UUID{cacheRow.ID})
+	groupedAtt := h.groupAttachments(r, []pgtype.UUID{cacheRow.ID})
+	cid := uuidToString(cacheRow.ID)
+	resp := commentToResponse(cacheRow, grouped[cid], groupedAtt[cid])
+	slog.Info("comment updated (gitlab write-through)",
+		append(logger.RequestAttrs(r), "comment_id", commentId, "gitlab_note_id", glNote.ID)...)
 	h.publish(protocol.EventCommentUpdated, workspaceID, actorType, actorID, map[string]any{"comment": resp})
 	writeJSON(w, http.StatusOK, resp)
 }

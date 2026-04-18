@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	gitlabsync "github.com/multica-ai/multica/server/internal/gitlab"
 )
 
@@ -248,5 +249,222 @@ func TestCreateComment_WriteThroughGitLabErrorReturns502(t *testing.T) {
 		issueID).Scan(&count)
 	if count != 0 {
 		t.Errorf("expected 0 comment rows, got %d (write-through must not leave orphan cache rows)", count)
+	}
+}
+
+// TestUpdateComment_WriteThroughSendsPUT verifies that on a GitLab-connected
+// workspace, editing a comment PUTs to GitLab's notes endpoint with the new
+// body, and the cache row is updated from the returned representation.
+func TestUpdateComment_WriteThroughSendsPUT(t *testing.T) {
+	ctx := context.Background()
+
+	var capturedMethod, capturedPath string
+	var capturedBody map[string]any
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":8810,"body":"edited","author":{"id":9},"created_at":"2026-04-17T12:00:00Z","updated_at":"2026-04-17T13:00:00Z"}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 510, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
+
+	// Seed an existing human-authored comment with a known gitlab_note_id.
+	commentID := uuid.New().String()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO comment (id, workspace_id, issue_id, author_type, author_id, content, type,
+			gitlab_note_id, external_updated_at)
+		 VALUES ($1, $2, $3, 'member', $4, 'original', 'comment', 8810, '2026-04-17T12:00:00Z')`,
+		commentID, parseUUID(testWorkspaceID), parseUUID(issueID), parseUUID(testUserID)); err != nil {
+		t.Fatalf("seed comment: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM comment WHERE id = $1`, commentID)
+	})
+
+	body, _ := json.Marshal(map[string]any{"content": "edited"})
+	req := httptest.NewRequest(http.MethodPut, "/api/comments/"+commentID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "commentId", commentID)
+	rec := httptest.NewRecorder()
+
+	h.UpdateComment(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if capturedMethod != http.MethodPut {
+		t.Errorf("method = %s, want PUT", capturedMethod)
+	}
+	if capturedPath != "/api/v4/projects/42/issues/510/notes/8810" {
+		t.Errorf("path = %s", capturedPath)
+	}
+	if got, _ := capturedBody["body"].(string); got != "edited" {
+		t.Errorf("GitLab body = %v, want %q", capturedBody["body"], "edited")
+	}
+
+	var cachedContent string
+	if err := testPool.QueryRow(ctx,
+		`SELECT content FROM comment WHERE id = $1`, commentID,
+	).Scan(&cachedContent); err != nil {
+		t.Fatalf("read cache row: %v", err)
+	}
+	if cachedContent != "edited" {
+		t.Errorf("cached content = %q, want %q", cachedContent, "edited")
+	}
+}
+
+// TestUpdateComment_WriteThroughPreservesAgentPrefix verifies that editing an
+// agent-authored comment PUTs the body with the canonical
+// "**[agent:<slug>]** " prefix preserved — derived from the cache row's
+// existing author_type/author_id, not the request actor.
+func TestUpdateComment_WriteThroughPreservesAgentPrefix(t *testing.T) {
+	ctx := context.Background()
+
+	// Look up the Handler Test Agent. Slug = "handler-test-agent".
+	var agentID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
+		testWorkspaceID, "Handler Test Agent",
+	).Scan(&agentID); err != nil {
+		t.Fatalf("look up test agent: %v", err)
+	}
+
+	var capturedBody map[string]any
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		// Echo the prefixed body back so TranslateNote strips it before the
+		// cache upsert — matching the webhook-replay shape.
+		_, _ = w.Write([]byte(`{"id":8811,"body":"**[agent:handler-test-agent]** updated","author":{"id":9},"created_at":"2026-04-17T12:00:00Z","updated_at":"2026-04-17T13:00:00Z"}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 511, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
+
+	// Seed an existing agent-authored comment.
+	commentID := uuid.New().String()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO comment (id, workspace_id, issue_id, author_type, author_id, content, type,
+			gitlab_note_id, external_updated_at)
+		 VALUES ($1, $2, $3, 'agent', $4, 'original', 'comment', 8811, '2026-04-17T12:00:00Z')`,
+		commentID, parseUUID(testWorkspaceID), parseUUID(issueID), parseUUID(agentID)); err != nil {
+		t.Fatalf("seed comment: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM comment WHERE id = $1`, commentID)
+	})
+
+	// Edit as the same agent (X-Agent-ID header) so the auth check passes.
+	body, _ := json.Marshal(map[string]any{"content": "updated"})
+	req := httptest.NewRequest(http.MethodPut, "/api/comments/"+commentID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req.Header.Set("X-Agent-ID", agentID)
+	req = withURLParam(req, "commentId", commentID)
+	rec := httptest.NewRecorder()
+
+	h.UpdateComment(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	gotBody, _ := capturedBody["body"].(string)
+	want := "**[agent:handler-test-agent]** updated"
+	if gotBody != want {
+		t.Errorf("GitLab body = %q, want %q", gotBody, want)
+	}
+
+	// Cache row's content must be the stripped body (TranslateNote strips
+	// the prefix before the upsert).
+	var cachedContent string
+	if err := testPool.QueryRow(ctx,
+		`SELECT content FROM comment WHERE id = $1`, commentID,
+	).Scan(&cachedContent); err != nil {
+		t.Fatalf("read cache row: %v", err)
+	}
+	if cachedContent != "updated" {
+		t.Errorf("cached content = %q, want %q", cachedContent, "updated")
+	}
+}
+
+// TestUpdateComment_WriteThroughGitLabErrorReturns502 verifies that when
+// GitLab returns an error on PUT notes, the handler returns a non-2xx status
+// and the cache row content is NOT mutated — no divergence between GitLab
+// and Multica on write failure.
+func TestUpdateComment_WriteThroughGitLabErrorReturns502(t *testing.T) {
+	ctx := context.Background()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"forbidden"}`))
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 512, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID)
+
+	commentID := uuid.New().String()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO comment (id, workspace_id, issue_id, author_type, author_id, content, type,
+			gitlab_note_id, external_updated_at)
+		 VALUES ($1, $2, $3, 'member', $4, 'original', 'comment', 8812, '2026-04-17T12:00:00Z')`,
+		commentID, parseUUID(testWorkspaceID), parseUUID(issueID), parseUUID(testUserID)); err != nil {
+		t.Fatalf("seed comment: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(ctx, `DELETE FROM comment WHERE id = $1`, commentID)
+	})
+
+	body, _ := json.Marshal(map[string]any{"content": "edited"})
+	req := httptest.NewRequest(http.MethodPut, "/api/comments/"+commentID, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "commentId", commentID)
+	rec := httptest.NewRecorder()
+
+	h.UpdateComment(rec, req)
+
+	if rec.Code < 400 {
+		t.Fatalf("expected >=400, got %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Code != http.StatusBadGateway {
+		if !strings.Contains(rec.Body.String(), "gitlab") {
+			t.Errorf("status = %d, want 502 (body=%s)", rec.Code, rec.Body.String())
+		}
+	}
+
+	// Cache row must NOT have been mutated — content still "original".
+	var cachedContent string
+	if err := testPool.QueryRow(ctx,
+		`SELECT content FROM comment WHERE id = $1`, commentID,
+	).Scan(&cachedContent); err != nil {
+		t.Fatalf("read cache row: %v", err)
+	}
+	if cachedContent != "original" {
+		t.Errorf("cached content = %q, want %q (write-through must not mutate cache on GitLab error)", cachedContent, "original")
 	}
 }
