@@ -357,6 +357,15 @@ func ApplyEmojiHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 		glUser = pgtype.Int8{Int64: p.User.ID, Valid: true}
 	}
 
+	// Translate GitLab's named shortcode back to the unicode Multica stores.
+	// Unmapped shortcodes fall back to the raw shortcode string — the cache
+	// row still persists, the frontend just renders the literal text until
+	// the shortcode is added to emojiUnicodeToShortcode.
+	cacheEmoji := p.ObjectAttributes.Name
+	if unicode, ok := EmojiShortcodeToUnicode(p.ObjectAttributes.Name); ok {
+		cacheEmoji = unicode
+	}
+
 	switch p.ObjectAttributes.AwardableType {
 	case "Issue":
 		parent, err := deps.Queries.GetIssueByGitlabID(ctx, db.GetIssueByGitlabIDParams{
@@ -372,7 +381,7 @@ func ApplyEmojiHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 			ActorType:         actorType,
 			ActorID:           actorID,
 			GitlabActorUserID: glUser,
-			Emoji:             p.ObjectAttributes.Name,
+			Emoji:             cacheEmoji,
 			GitlabAwardID:     pgtype.Int8{Int64: p.ObjectAttributes.ID, Valid: true},
 			ExternalUpdatedAt: parseTS(p.ObjectAttributes.UpdatedAt),
 		}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -391,7 +400,7 @@ func ApplyEmojiHookEvent(ctx context.Context, deps WebhookDeps, body []byte) err
 			ActorType:         actorType,
 			ActorID:           actorID,
 			GitlabActorUserID: glUser,
-			Emoji:             p.ObjectAttributes.Name,
+			Emoji:             cacheEmoji,
 			GitlabAwardID:     pgtype.Int8{Int64: p.ObjectAttributes.ID, Valid: true},
 			ExternalUpdatedAt: parseTS(p.ObjectAttributes.UpdatedAt),
 		}); err != nil && !errors.Is(err, pgx.ErrNoRows) {

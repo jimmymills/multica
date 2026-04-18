@@ -257,8 +257,10 @@ func TestApplyEmojiHookEvent_UpsertsReaction(t *testing.T) {
 	pool.QueryRow(context.Background(),
 		`SELECT emoji FROM issue_reaction WHERE issue_id = $1::uuid AND gitlab_award_id = 500`,
 		uuidString(row.ID)).Scan(&emoji)
-	if emoji != "thumbsup" {
-		t.Errorf("emoji = %q", emoji)
+	// Webhook delivers GitLab's shortcode; cache stores the translated unicode
+	// so the frontend renders natively.
+	if emoji != "👍" {
+		t.Errorf("emoji = %q, want 👍 (translated from 'thumbsup')", emoji)
 	}
 }
 
@@ -611,8 +613,9 @@ func TestApplyEmojiHookEvent_NoteLevelAwardUpsertsCommentReaction(t *testing.T) 
 	if err != nil {
 		t.Fatalf("select comment_reaction: %v", err)
 	}
-	if emoji != "tada" {
-		t.Errorf("emoji = %q, want tada", emoji)
+	// Webhook delivers "tada"; cache stores translated unicode 🎉.
+	if emoji != "🎉" {
+		t.Errorf("emoji = %q, want 🎉 (translated from 'tada')", emoji)
 	}
 	if actorType.Valid {
 		t.Errorf("actor_type = %+v, want NULL for unmapped user", actorType)
