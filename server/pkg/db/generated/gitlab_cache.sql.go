@@ -203,6 +203,31 @@ func (q *Queries) GetIssueByGitlabIID(ctx context.Context, arg GetIssueByGitlabI
 	return i, err
 }
 
+const getIssueReactionByGitlabAwardID = `-- name: GetIssueReactionByGitlabAwardID :one
+SELECT id, issue_id, workspace_id, actor_type, actor_id, emoji, created_at, gitlab_award_id, external_updated_at, gitlab_actor_user_id FROM issue_reaction WHERE gitlab_award_id = $1 LIMIT 1
+`
+
+// Used by the write-through path when the clobber guard short-circuits
+// (pgx.ErrNoRows from the upsert) to load the row the concurrent webhook
+// already wrote.
+func (q *Queries) GetIssueReactionByGitlabAwardID(ctx context.Context, gitlabAwardID pgtype.Int8) (IssueReaction, error) {
+	row := q.db.QueryRow(ctx, getIssueReactionByGitlabAwardID, gitlabAwardID)
+	var i IssueReaction
+	err := row.Scan(
+		&i.ID,
+		&i.IssueID,
+		&i.WorkspaceID,
+		&i.ActorType,
+		&i.ActorID,
+		&i.Emoji,
+		&i.CreatedAt,
+		&i.GitlabAwardID,
+		&i.ExternalUpdatedAt,
+		&i.GitlabActorUserID,
+	)
+	return i, err
+}
+
 const listGitlabLabels = `-- name: ListGitlabLabels :many
 SELECT workspace_id, gitlab_label_id, name, color, description, external_updated_at FROM gitlab_label
 WHERE workspace_id = $1

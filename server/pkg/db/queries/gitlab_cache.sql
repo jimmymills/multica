@@ -172,6 +172,12 @@ ON CONFLICT (gitlab_award_id) WHERE gitlab_award_id IS NOT NULL DO UPDATE SET
     external_updated_at = EXCLUDED.external_updated_at
 RETURNING *;
 
+-- name: GetIssueReactionByGitlabAwardID :one
+-- Used by the write-through path when the clobber guard short-circuits
+-- (pgx.ErrNoRows from the upsert) to load the row the concurrent webhook
+-- already wrote.
+SELECT * FROM issue_reaction WHERE gitlab_award_id = $1 LIMIT 1;
+
 -- name: UpsertCommentReactionFromGitlab :one
 INSERT INTO comment_reaction (
     workspace_id,
