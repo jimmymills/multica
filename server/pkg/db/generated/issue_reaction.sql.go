@@ -50,6 +50,53 @@ func (q *Queries) AddIssueReaction(ctx context.Context, arg AddIssueReactionPara
 	return i, err
 }
 
+const deleteIssueReactionByID = `-- name: DeleteIssueReactionByID :exec
+DELETE FROM issue_reaction WHERE id = $1
+`
+
+func (q *Queries) DeleteIssueReactionByID(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteIssueReactionByID, id)
+	return err
+}
+
+const getIssueReactionByKey = `-- name: GetIssueReactionByKey :one
+SELECT id, issue_id, workspace_id, actor_type, actor_id, emoji, created_at, gitlab_award_id, external_updated_at, gitlab_actor_user_id FROM issue_reaction
+WHERE issue_id = $1 AND actor_type = $2 AND actor_id = $3 AND emoji = $4
+LIMIT 1
+`
+
+type GetIssueReactionByKeyParams struct {
+	IssueID   pgtype.UUID `json:"issue_id"`
+	ActorType pgtype.Text `json:"actor_type"`
+	ActorID   pgtype.UUID `json:"actor_id"`
+	Emoji     string      `json:"emoji"`
+}
+
+// Used by the DELETE write-through path to look up the local cache row
+// (including its gitlab_award_id) before calling GitLab.
+func (q *Queries) GetIssueReactionByKey(ctx context.Context, arg GetIssueReactionByKeyParams) (IssueReaction, error) {
+	row := q.db.QueryRow(ctx, getIssueReactionByKey,
+		arg.IssueID,
+		arg.ActorType,
+		arg.ActorID,
+		arg.Emoji,
+	)
+	var i IssueReaction
+	err := row.Scan(
+		&i.ID,
+		&i.IssueID,
+		&i.WorkspaceID,
+		&i.ActorType,
+		&i.ActorID,
+		&i.Emoji,
+		&i.CreatedAt,
+		&i.GitlabAwardID,
+		&i.ExternalUpdatedAt,
+		&i.GitlabActorUserID,
+	)
+	return i, err
+}
+
 const listIssueReactions = `-- name: ListIssueReactions :many
 SELECT id, issue_id, workspace_id, actor_type, actor_id, emoji, created_at, gitlab_award_id, external_updated_at, gitlab_actor_user_id FROM issue_reaction
 WHERE issue_id = $1

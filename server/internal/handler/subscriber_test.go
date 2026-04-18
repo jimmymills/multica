@@ -10,6 +10,392 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// TestSubscribeToIssue_WriteThroughHumanCallsGitLab verifies that on a
+// GitLab-connected workspace, a member subscribing to a GitLab-backed issue
+// POSTs /api/v4/projects/:id/issues/:iid/subscribe with the caller's PAT and
+// then upserts the local subscriber cache row.
+func TestSubscribeToIssue_WriteThroughHumanCallsGitLab(t *testing.T) {
+	ctx := context.Background()
+
+	var capturedMethod, capturedPath string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 800, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/subscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.SubscribeToIssue(rec, req)
+
+	if rec.Code < 200 || rec.Code >= 300 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if capturedMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", capturedMethod)
+	}
+	if capturedPath != "/api/v4/projects/42/issues/800/subscribe" {
+		t.Errorf("path = %s", capturedPath)
+	}
+	var count int
+	_ = testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_subscriber WHERE issue_id = $1 AND user_id = $2 AND user_type = 'member'`,
+		parseUUID(issueID), parseUUID(testUserID)).Scan(&count)
+	if count != 1 {
+		t.Errorf("cache subscriber missing, count=%d", count)
+	}
+}
+
+// TestSubscribeToIssue_WriteThroughAgentStaysMulticaOnly verifies that an
+// agent-authored subscribe (X-Agent-ID header set) on a GitLab-connected
+// workspace never calls GitLab — agent subscriptions are Multica-only —
+// but still writes the Multica cache row.
+func TestSubscribeToIssue_WriteThroughAgentStaysMulticaOnly(t *testing.T) {
+	ctx := context.Background()
+
+	var gitlabCalls int
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gitlabCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	// Look up the seeded Handler Test Agent.
+	var agentID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
+		testWorkspaceID, "Handler Test Agent",
+	).Scan(&agentID); err != nil {
+		t.Fatalf("look up test agent: %v", err)
+	}
+
+	issueID := seedGitlabConnectedIssue(t, 801, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/subscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req.Header.Set("X-Agent-ID", agentID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.SubscribeToIssue(rec, req)
+
+	if rec.Code < 200 || rec.Code >= 300 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gitlabCalls != 0 {
+		t.Errorf("GitLab got %d calls — agent subscribes stay Multica-only", gitlabCalls)
+	}
+	var count int
+	_ = testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_subscriber WHERE issue_id = $1 AND user_type = 'agent'`,
+		parseUUID(issueID)).Scan(&count)
+	if count != 1 {
+		t.Errorf("Multica cache row missing, count=%d", count)
+	}
+}
+
+// TestSubscribeToIssue_WriteThroughGitLabErrorReturns502 verifies that a
+// non-idempotent GitLab error on the write-through branch aborts the request
+// and does NOT leave an orphaned cache row behind.
+func TestSubscribeToIssue_WriteThroughGitLabErrorReturns502(t *testing.T) {
+	ctx := context.Background()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 802, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/subscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.SubscribeToIssue(rec, req)
+
+	if rec.Code < 400 {
+		t.Fatalf("status = %d, want >=400", rec.Code)
+	}
+	var count int
+	_ = testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_subscriber WHERE issue_id = $1`,
+		parseUUID(issueID)).Scan(&count)
+	if count != 0 {
+		t.Errorf("cache leaked on error, count=%d", count)
+	}
+}
+
+// TestSubscribeToIssue_WriteThrough304TreatedAsIdempotent verifies that when
+// GitLab returns 304 (user already subscribed), Client.Subscribe treats it as
+// success and the handler still adds the idempotent cache row.
+func TestSubscribeToIssue_WriteThrough304TreatedAsIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 803, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/subscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.SubscribeToIssue(rec, req)
+
+	if rec.Code < 200 || rec.Code >= 300 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var count int
+	_ = testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_subscriber WHERE issue_id = $1 AND user_id = $2`,
+		parseUUID(issueID), parseUUID(testUserID)).Scan(&count)
+	if count != 1 {
+		t.Errorf("cache subscriber missing after 304, count=%d", count)
+	}
+}
+
+// TestUnsubscribeFromIssue_WriteThroughHumanCallsGitLab verifies that on a
+// GitLab-connected workspace, a member unsubscribing from a GitLab-backed
+// issue POSTs /api/v4/projects/:id/issues/:iid/unsubscribe with the caller's
+// PAT and then removes the local subscriber cache row.
+func TestUnsubscribeFromIssue_WriteThroughHumanCallsGitLab(t *testing.T) {
+	ctx := context.Background()
+
+	var capturedPath string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 810, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	// Pre-subscribe the user so Unsubscribe has something to remove.
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue_subscriber (issue_id, user_type, user_id, reason) VALUES ($1, 'member', $2, 'manual') ON CONFLICT DO NOTHING`,
+		parseUUID(issueID), parseUUID(testUserID)); err != nil {
+		t.Fatalf("pre-subscribe: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/unsubscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.UnsubscribeFromIssue(rec, req)
+
+	if rec.Code < 200 || rec.Code >= 300 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if capturedPath != "/api/v4/projects/42/issues/810/unsubscribe" {
+		t.Errorf("path = %s", capturedPath)
+	}
+	var count int
+	_ = testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_subscriber WHERE issue_id = $1 AND user_id = $2`,
+		parseUUID(issueID), parseUUID(testUserID)).Scan(&count)
+	if count != 0 {
+		t.Errorf("cache subscriber should be removed, count=%d", count)
+	}
+}
+
+// TestUnsubscribeFromIssue_WriteThroughAgentStaysMulticaOnly verifies that an
+// agent-authored unsubscribe (X-Agent-ID header set) on a GitLab-connected
+// workspace never calls GitLab — agent subscriptions are Multica-only.
+func TestUnsubscribeFromIssue_WriteThroughAgentStaysMulticaOnly(t *testing.T) {
+	ctx := context.Background()
+
+	var gitlabCalls int
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gitlabCalls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	var agentID string
+	if err := testPool.QueryRow(ctx,
+		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
+		testWorkspaceID, "Handler Test Agent",
+	).Scan(&agentID); err != nil {
+		t.Fatalf("look up test agent: %v", err)
+	}
+
+	issueID := seedGitlabConnectedIssue(t, 811, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue_subscriber (issue_id, user_type, user_id, reason) VALUES ($1, 'agent', $2, 'manual') ON CONFLICT DO NOTHING`,
+		parseUUID(issueID), parseUUID(agentID)); err != nil {
+		t.Fatalf("pre-subscribe agent: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/unsubscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req.Header.Set("X-Agent-ID", agentID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.UnsubscribeFromIssue(rec, req)
+
+	if rec.Code < 200 || rec.Code >= 300 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gitlabCalls != 0 {
+		t.Errorf("GitLab got %d calls — agent unsubscribes must stay Multica-only", gitlabCalls)
+	}
+}
+
+// TestUnsubscribeFromIssue_WriteThroughGitLabErrorPreservesCache verifies that
+// a non-idempotent GitLab error on the write-through branch aborts the
+// request and does NOT mutate the local cache row.
+func TestUnsubscribeFromIssue_WriteThroughGitLabErrorPreservesCache(t *testing.T) {
+	ctx := context.Background()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 812, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue_subscriber (issue_id, user_type, user_id, reason) VALUES ($1, 'member', $2, 'manual') ON CONFLICT DO NOTHING`,
+		parseUUID(issueID), parseUUID(testUserID)); err != nil {
+		t.Fatalf("pre-subscribe: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/unsubscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.UnsubscribeFromIssue(rec, req)
+
+	if rec.Code < 400 {
+		t.Fatalf("status = %d, want >=400", rec.Code)
+	}
+	var count int
+	_ = testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_subscriber WHERE issue_id = $1 AND user_id = $2`,
+		parseUUID(issueID), parseUUID(testUserID)).Scan(&count)
+	if count != 1 {
+		t.Errorf("cache mutated on error, count=%d", count)
+	}
+}
+
+// TestUnsubscribeFromIssue_WriteThrough304TreatedAsIdempotent verifies that
+// when GitLab returns 304 (user not currently subscribed — e.g. the legacy
+// subscribe happened but an admin already unsubscribed server-side),
+// Client.Unsubscribe treats it as success and the handler still removes the
+// local subscriber row.
+func TestUnsubscribeFromIssue_WriteThrough304TreatedAsIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer fake.Close()
+
+	h := buildHandlerWithGitlab(t, fake.URL)
+	defer h.Queries.DeleteWorkspaceGitlabConnection(ctx, parseUUID(testWorkspaceID))
+
+	seedGitlabWriteThroughFixture(t, h)
+
+	issueID := seedGitlabConnectedIssue(t, 813, 42)
+	defer testPool.Exec(ctx, `DELETE FROM issue_subscriber WHERE issue_id = $1`, parseUUID(issueID))
+	defer testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, parseUUID(issueID))
+
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO issue_subscriber (issue_id, user_type, user_id, reason) VALUES ($1, 'member', $2, 'manual') ON CONFLICT DO NOTHING`,
+		parseUUID(issueID), parseUUID(testUserID)); err != nil {
+		t.Fatalf("pre-subscribe: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/issues/"+issueID+"/unsubscribe", nil)
+	req.Header.Set("X-User-ID", testUserID)
+	req.Header.Set("X-Workspace-ID", testWorkspaceID)
+	req = withURLParam(req, "id", issueID)
+	rec := httptest.NewRecorder()
+
+	h.UnsubscribeFromIssue(rec, req)
+
+	if rec.Code < 200 || rec.Code >= 300 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var count int
+	_ = testPool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM issue_subscriber WHERE issue_id = $1 AND user_id = $2`,
+		parseUUID(issueID), parseUUID(testUserID)).Scan(&count)
+	if count != 0 {
+		t.Errorf("cache subscriber should be removed after 304, count=%d", count)
+	}
+}
+
 func TestSubscriberAPI(t *testing.T) {
 	ctx := context.Background()
 

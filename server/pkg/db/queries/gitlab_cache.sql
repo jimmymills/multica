@@ -170,4 +170,43 @@ ON CONFLICT (gitlab_award_id) WHERE gitlab_award_id IS NOT NULL DO UPDATE SET
     actor_id = EXCLUDED.actor_id,
     gitlab_actor_user_id = EXCLUDED.gitlab_actor_user_id,
     external_updated_at = EXCLUDED.external_updated_at
+WHERE issue_reaction.external_updated_at IS NULL
+   OR issue_reaction.external_updated_at < EXCLUDED.external_updated_at
 RETURNING *;
+
+-- name: GetIssueReactionByGitlabAwardID :one
+-- Used by the write-through path when the clobber guard short-circuits
+-- (pgx.ErrNoRows from the upsert) to load the row the concurrent webhook
+-- already wrote.
+SELECT * FROM issue_reaction WHERE gitlab_award_id = $1 LIMIT 1;
+
+-- name: UpsertCommentReactionFromGitlab :one
+INSERT INTO comment_reaction (
+    workspace_id,
+    comment_id,
+    actor_type,
+    actor_id,
+    gitlab_actor_user_id,
+    emoji,
+    gitlab_award_id,
+    external_updated_at
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (gitlab_award_id) WHERE gitlab_award_id IS NOT NULL DO UPDATE SET
+    actor_type = EXCLUDED.actor_type,
+    actor_id = EXCLUDED.actor_id,
+    gitlab_actor_user_id = EXCLUDED.gitlab_actor_user_id,
+    emoji = EXCLUDED.emoji,
+    external_updated_at = EXCLUDED.external_updated_at
+WHERE comment_reaction.external_updated_at IS NULL
+   OR comment_reaction.external_updated_at < EXCLUDED.external_updated_at
+RETURNING *;
+
+-- name: GetCommentReactionByGitlabAwardID :one
+-- Used by the write-through path when the clobber guard short-circuits
+-- (pgx.ErrNoRows from the upsert) to load the row the concurrent webhook
+-- already wrote.
+SELECT * FROM comment_reaction WHERE gitlab_award_id = $1 LIMIT 1;
+
+-- name: DeleteCommentReactionByGitlabAwardID :exec
+DELETE FROM comment_reaction WHERE gitlab_award_id = $1;

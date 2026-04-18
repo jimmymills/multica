@@ -39,6 +39,15 @@ func (q *Queries) ClearIssueLabels(ctx context.Context, issueID pgtype.UUID) err
 	return err
 }
 
+const deleteCommentReactionByGitlabAwardID = `-- name: DeleteCommentReactionByGitlabAwardID :exec
+DELETE FROM comment_reaction WHERE gitlab_award_id = $1
+`
+
+func (q *Queries) DeleteCommentReactionByGitlabAwardID(ctx context.Context, gitlabAwardID pgtype.Int8) error {
+	_, err := q.db.Exec(ctx, deleteCommentReactionByGitlabAwardID, gitlabAwardID)
+	return err
+}
+
 const deleteGitlabLabel = `-- name: DeleteGitlabLabel :exec
 DELETE FROM gitlab_label
 WHERE workspace_id = $1 AND gitlab_label_id = $2
@@ -79,6 +88,31 @@ DELETE FROM gitlab_project_member WHERE workspace_id = $1
 func (q *Queries) DeleteWorkspaceGitlabMembers(ctx context.Context, workspaceID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, deleteWorkspaceGitlabMembers, workspaceID)
 	return err
+}
+
+const getCommentReactionByGitlabAwardID = `-- name: GetCommentReactionByGitlabAwardID :one
+SELECT id, comment_id, workspace_id, actor_type, actor_id, emoji, created_at, gitlab_award_id, external_updated_at, gitlab_actor_user_id FROM comment_reaction WHERE gitlab_award_id = $1 LIMIT 1
+`
+
+// Used by the write-through path when the clobber guard short-circuits
+// (pgx.ErrNoRows from the upsert) to load the row the concurrent webhook
+// already wrote.
+func (q *Queries) GetCommentReactionByGitlabAwardID(ctx context.Context, gitlabAwardID pgtype.Int8) (CommentReaction, error) {
+	row := q.db.QueryRow(ctx, getCommentReactionByGitlabAwardID, gitlabAwardID)
+	var i CommentReaction
+	err := row.Scan(
+		&i.ID,
+		&i.CommentID,
+		&i.WorkspaceID,
+		&i.ActorType,
+		&i.ActorID,
+		&i.Emoji,
+		&i.CreatedAt,
+		&i.GitlabAwardID,
+		&i.ExternalUpdatedAt,
+		&i.GitlabActorUserID,
+	)
+	return i, err
 }
 
 const getGitlabLabelByName = `-- name: GetGitlabLabelByName :one
@@ -190,6 +224,31 @@ func (q *Queries) GetIssueByGitlabIID(ctx context.Context, arg GetIssueByGitlabI
 		&i.GitlabProjectID,
 		&i.ExternalUpdatedAt,
 		&i.GitlabIssueID,
+	)
+	return i, err
+}
+
+const getIssueReactionByGitlabAwardID = `-- name: GetIssueReactionByGitlabAwardID :one
+SELECT id, issue_id, workspace_id, actor_type, actor_id, emoji, created_at, gitlab_award_id, external_updated_at, gitlab_actor_user_id FROM issue_reaction WHERE gitlab_award_id = $1 LIMIT 1
+`
+
+// Used by the write-through path when the clobber guard short-circuits
+// (pgx.ErrNoRows from the upsert) to load the row the concurrent webhook
+// already wrote.
+func (q *Queries) GetIssueReactionByGitlabAwardID(ctx context.Context, gitlabAwardID pgtype.Int8) (IssueReaction, error) {
+	row := q.db.QueryRow(ctx, getIssueReactionByGitlabAwardID, gitlabAwardID)
+	var i IssueReaction
+	err := row.Scan(
+		&i.ID,
+		&i.IssueID,
+		&i.WorkspaceID,
+		&i.ActorType,
+		&i.ActorID,
+		&i.Emoji,
+		&i.CreatedAt,
+		&i.GitlabAwardID,
+		&i.ExternalUpdatedAt,
+		&i.GitlabActorUserID,
 	)
 	return i, err
 }
@@ -366,6 +425,67 @@ func (q *Queries) UpsertCommentFromGitlab(ctx context.Context, arg UpsertComment
 		&i.GitlabNoteID,
 		&i.ExternalUpdatedAt,
 		&i.GitlabAuthorUserID,
+	)
+	return i, err
+}
+
+const upsertCommentReactionFromGitlab = `-- name: UpsertCommentReactionFromGitlab :one
+INSERT INTO comment_reaction (
+    workspace_id,
+    comment_id,
+    actor_type,
+    actor_id,
+    gitlab_actor_user_id,
+    emoji,
+    gitlab_award_id,
+    external_updated_at
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (gitlab_award_id) WHERE gitlab_award_id IS NOT NULL DO UPDATE SET
+    actor_type = EXCLUDED.actor_type,
+    actor_id = EXCLUDED.actor_id,
+    gitlab_actor_user_id = EXCLUDED.gitlab_actor_user_id,
+    emoji = EXCLUDED.emoji,
+    external_updated_at = EXCLUDED.external_updated_at
+WHERE comment_reaction.external_updated_at IS NULL
+   OR comment_reaction.external_updated_at < EXCLUDED.external_updated_at
+RETURNING id, comment_id, workspace_id, actor_type, actor_id, emoji, created_at, gitlab_award_id, external_updated_at, gitlab_actor_user_id
+`
+
+type UpsertCommentReactionFromGitlabParams struct {
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	CommentID         pgtype.UUID        `json:"comment_id"`
+	ActorType         string             `json:"actor_type"`
+	ActorID           pgtype.UUID        `json:"actor_id"`
+	GitlabActorUserID pgtype.Int8        `json:"gitlab_actor_user_id"`
+	Emoji             string             `json:"emoji"`
+	GitlabAwardID     pgtype.Int8        `json:"gitlab_award_id"`
+	ExternalUpdatedAt pgtype.Timestamptz `json:"external_updated_at"`
+}
+
+func (q *Queries) UpsertCommentReactionFromGitlab(ctx context.Context, arg UpsertCommentReactionFromGitlabParams) (CommentReaction, error) {
+	row := q.db.QueryRow(ctx, upsertCommentReactionFromGitlab,
+		arg.WorkspaceID,
+		arg.CommentID,
+		arg.ActorType,
+		arg.ActorID,
+		arg.GitlabActorUserID,
+		arg.Emoji,
+		arg.GitlabAwardID,
+		arg.ExternalUpdatedAt,
+	)
+	var i CommentReaction
+	err := row.Scan(
+		&i.ID,
+		&i.CommentID,
+		&i.WorkspaceID,
+		&i.ActorType,
+		&i.ActorID,
+		&i.Emoji,
+		&i.CreatedAt,
+		&i.GitlabAwardID,
+		&i.ExternalUpdatedAt,
+		&i.GitlabActorUserID,
 	)
 	return i, err
 }
@@ -581,6 +701,8 @@ ON CONFLICT (gitlab_award_id) WHERE gitlab_award_id IS NOT NULL DO UPDATE SET
     actor_id = EXCLUDED.actor_id,
     gitlab_actor_user_id = EXCLUDED.gitlab_actor_user_id,
     external_updated_at = EXCLUDED.external_updated_at
+WHERE issue_reaction.external_updated_at IS NULL
+   OR issue_reaction.external_updated_at < EXCLUDED.external_updated_at
 RETURNING id, issue_id, workspace_id, actor_type, actor_id, emoji, created_at, gitlab_award_id, external_updated_at, gitlab_actor_user_id
 `
 

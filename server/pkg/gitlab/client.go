@@ -79,6 +79,8 @@ func (c *Client) do(ctx context.Context, method, token, path string, body, out a
 	}
 
 	switch resp.StatusCode {
+	case http.StatusNotModified:
+		return ErrNotModified
 	case http.StatusUnauthorized:
 		return fmt.Errorf("%w: %s", ErrUnauthorized, msg)
 	case http.StatusForbidden:
