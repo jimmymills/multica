@@ -4,6 +4,7 @@ import "errors"
 
 // Sentinel errors that callers match via errors.Is.
 var (
+	ErrNotModified  = errors.New("gitlab: not modified (304)")
 	ErrUnauthorized = errors.New("gitlab: unauthorized (401)")
 	ErrForbidden    = errors.New("gitlab: forbidden (403)")
 	ErrNotFound     = errors.New("gitlab: not found (404)")
