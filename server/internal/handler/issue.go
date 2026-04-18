@@ -934,6 +934,22 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			if req.Description != nil {
 				descStr = *req.Description
 			}
+
+			// Resolve the requested member assignee (if any) to a GitLab user ID
+			// so the translator can populate GitLab's native assignee_ids. When
+			// the member has no user_gitlab_connection, they're absent from the
+			// map and the translator falls back to cache-only semantics.
+			memberUUIDs := []string{}
+			if assigneeTypeStr == "member" && assigneeIDStr != "" {
+				memberUUIDs = append(memberUUIDs, assigneeIDStr)
+			}
+			memberGitlabMap, err := h.buildMemberGitlabUserMap(r.Context(), parseUUID(workspaceID), memberUUIDs)
+			if err != nil {
+				slog.Error("member gitlab user map", "error", err)
+				writeError(w, http.StatusInternalServerError, "build member map failed")
+				return
+			}
+
 			glInput := gitlabsync.BuildCreateIssueInput(gitlabsync.CreateIssueRequest{
 				Title:        req.Title,
 				Description:  descStr,
@@ -941,7 +957,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 				Priority:     priority,
 				AssigneeType: assigneeTypeStr,
 				AssigneeID:   assigneeIDStr,
-			}, agentSlugMap, nil)
+			}, agentSlugMap, memberGitlabMap)
 
 			glIssue, err := h.Gitlab.CreateIssue(r.Context(), token, wsConn.GitlabProjectID, glInput)
 			if err != nil {
@@ -956,6 +972,17 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 				agentByLabel[slug] = uuid
 			}
 			values := gitlabsync.TranslateIssue(*glIssue, &gitlabsync.TranslateContext{AgentBySlug: agentByLabel})
+
+			// Preserve the requested member assignee in the cache when the
+			// translator didn't resolve one from the GitLab response. This
+			// handles the unmapped-member case (no user_gitlab_connection):
+			// GitLab can't echo an assignee we never sent, but Multica should
+			// still record the member assignment locally. The translator's
+			// agent resolution takes precedence when a label was present.
+			if values.AssigneeType == "" && assigneeTypeStr == "member" && assigneeIDStr != "" {
+				values.AssigneeType = "member"
+				values.AssigneeID = assigneeIDStr
+			}
 
 			// Atomically increment the workspace issue counter and cache the GitLab row.
 			glTx, err := h.TxStarter.Begin(r.Context())
@@ -1157,6 +1184,34 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, resp)
+}
+
+// buildMemberGitlabUserMap resolves the Multica member UUIDs referenced in a
+// request to their GitLab user IDs. Used by write-through handlers that need
+// to set GitLab's native assignee_ids. Unmapped members (user without a PAT
+// connection) are absent from the returned map — the translator falls back to
+// cache-only behavior for them.
+func (h *Handler) buildMemberGitlabUserMap(ctx context.Context, workspaceID pgtype.UUID, memberUUIDs []string) (map[string]int64, error) {
+	out := make(map[string]int64, len(memberUUIDs))
+	for _, memberUUID := range memberUUIDs {
+		if memberUUID == "" {
+			continue
+		}
+		conn, err := h.Queries.GetUserGitlabConnection(ctx, db.GetUserGitlabConnectionParams{
+			UserID:      parseUUID(memberUUID),
+			WorkspaceID: workspaceID,
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				continue
+			}
+			return nil, err
+		}
+		if conn.GitlabUserID != 0 {
+			out[memberUUID] = conn.GitlabUserID
+		}
+	}
+	return out, nil
 }
 
 // buildUpsertParamsFromCreate converts a GitLab issue + translated IssueValues
