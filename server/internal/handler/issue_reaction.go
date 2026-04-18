@@ -220,6 +220,72 @@ func (h *Handler) RemoveIssueReaction(w http.ResponseWriter, r *http.Request) {
 	workspaceID := uuidToString(issue.WorkspaceID)
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
+	// Phase 3d write-through: on a GitLab-connected workspace, human-authored
+	// reaction removals look up the cache row's gitlab_award_id, DELETE the
+	// award on GitLab, then drop the local row. Agent reactions have no GitLab
+	// representation — they fall through to the legacy path.
+	if h.GitlabEnabled && h.GitlabResolver != nil && actorType != "agent" {
+		_, wsErr := h.Queries.GetWorkspaceGitlabConnection(r.Context(), issue.WorkspaceID)
+		if wsErr == nil {
+			existing, exErr := h.Queries.GetIssueReactionByKey(r.Context(), db.GetIssueReactionByKeyParams{
+				IssueID:   issue.ID,
+				ActorType: pgtype.Text{String: actorType, Valid: true},
+				ActorID:   parseUUID(actorID),
+				Emoji:     req.Emoji,
+			})
+			if exErr != nil {
+				if errors.Is(exErr, pgx.ErrNoRows) {
+					// No local row — idempotent success. No GitLab call.
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				slog.Error("lookup issue reaction for delete", "error", exErr, "issue_id", issueID)
+				writeError(w, http.StatusInternalServerError, "failed to remove reaction")
+				return
+			}
+
+			if !issue.GitlabIid.Valid || !issue.GitlabProjectID.Valid {
+				slog.Error("gitlab connected workspace but issue has no gitlab refs",
+					"issue_id", issueID, "workspace_id", workspaceID)
+				writeError(w, http.StatusBadGateway, "issue not linked to gitlab")
+				return
+			}
+
+			if existing.GitlabAwardID.Valid {
+				token, _, tokErr := h.GitlabResolver.ResolveTokenForWrite(r.Context(), workspaceID, actorType, actorID)
+				if tokErr != nil {
+					slog.Error("resolve gitlab token", "error", tokErr, "workspace_id", workspaceID)
+					writeError(w, http.StatusBadGateway, "could not resolve gitlab token")
+					return
+				}
+
+				if err := h.Gitlab.DeleteIssueAwardEmoji(r.Context(), token,
+					issue.GitlabProjectID.Int64, int(issue.GitlabIid.Int32), existing.GitlabAwardID.Int64); err != nil {
+					slog.Error("gitlab delete issue award_emoji", "error", err, "issue_id", issueID)
+					writeError(w, http.StatusBadGateway, "gitlab delete award_emoji failed")
+					return
+				}
+			}
+			// No gitlab_award_id → Multica-native row (pre-connection). Just drop locally.
+
+			if err := h.Queries.DeleteIssueReactionByID(r.Context(), existing.ID); err != nil {
+				slog.Error("delete issue reaction cache row", "error", err, "reaction_id", uuidToString(existing.ID))
+				writeError(w, http.StatusInternalServerError, "failed to remove reaction")
+				return
+			}
+
+			h.publish(protocol.EventIssueReactionRemoved, workspaceID, actorType, actorID, map[string]any{
+				"issue_id":   uuidToString(issue.ID),
+				"emoji":      req.Emoji,
+				"actor_type": actorType,
+				"actor_id":   actorID,
+			})
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		// wsErr != nil → fall through to legacy path (non-connected workspace).
+	}
+
 	if err := h.Queries.RemoveIssueReaction(r.Context(), db.RemoveIssueReactionParams{
 		IssueID:   issue.ID,
 		ActorType: pgtype.Text{String: actorType, Valid: true},

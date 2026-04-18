@@ -12,3 +12,13 @@ WHERE issue_id = $1 AND actor_type = $2 AND actor_id = $3 AND emoji = $4;
 SELECT * FROM issue_reaction
 WHERE issue_id = $1
 ORDER BY created_at ASC;
+
+-- name: GetIssueReactionByKey :one
+-- Used by the DELETE write-through path to look up the local cache row
+-- (including its gitlab_award_id) before calling GitLab.
+SELECT * FROM issue_reaction
+WHERE issue_id = $1 AND actor_type = $2 AND actor_id = $3 AND emoji = $4
+LIMIT 1;
+
+-- name: DeleteIssueReactionByID :exec
+DELETE FROM issue_reaction WHERE id = $1;
