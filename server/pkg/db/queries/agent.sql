@@ -187,13 +187,29 @@ WHERE id = $1
 RETURNING *;
 
 -- name: SelectRuntimeForAgent :one
--- Picks the least-busy runtime among the agent's assigned runtimes, using
--- 7-day token usage as the primary signal and most recent enqueue as the
--- LRU tiebreak. Online runtimes are preferred; if every assigned runtime
--- is offline the query still returns one so enqueue never fails for this
--- reason (matches current single-runtime behavior).
+-- Picks the least-busy runtime among the agent's effective runtime set
+-- (union of individual assignments and group members). An active override
+-- on any of the agent's groups wins absolute preference while its target is
+-- online. Online runtimes are preferred over offline; 7-day token sum then
+-- LRU (most recent enqueue) breaks ties. Returns a single runtime_id.
 WITH window_since AS (
     SELECT DATE_TRUNC('day', now() - INTERVAL '7 days', 'UTC') AS ts
+),
+candidates AS (
+    SELECT ara.runtime_id FROM agent_runtime_assignment ara WHERE ara.agent_id = $1
+    UNION
+    SELECT rgm.runtime_id
+    FROM agent_runtime_group c_arg
+    JOIN runtime_group_member rgm ON rgm.group_id = c_arg.group_id
+    WHERE c_arg.agent_id = $1
+),
+active_overrides AS (
+    SELECT rgo.runtime_id
+    FROM agent_runtime_group ao_arg
+    JOIN runtime_group_override rgo ON rgo.group_id = ao_arg.group_id
+    WHERE ao_arg.agent_id = $1
+      AND rgo.starts_at <= now()
+      AND now() < rgo.ends_at
 ),
 runtime_load AS (
     SELECT
@@ -205,18 +221,16 @@ runtime_load AS (
     LEFT JOIN task_usage tu
         ON tu.task_id = atq.id
        AND tu.created_at >= (SELECT ts FROM window_since)
-    WHERE atq.runtime_id IN (
-        SELECT runtime_id FROM agent_runtime_assignment WHERE agent_id = $1
-    )
+    WHERE atq.runtime_id IN (SELECT runtime_id FROM candidates)
       AND atq.created_at >= (SELECT ts FROM window_since)
     GROUP BY atq.runtime_id
 )
-SELECT ara.runtime_id
-FROM agent_runtime_assignment ara
-JOIN agent_runtime r ON r.id = ara.runtime_id
-LEFT JOIN runtime_load rl ON rl.runtime_id = ara.runtime_id
-WHERE ara.agent_id = $1
+SELECT c.runtime_id
+FROM candidates c
+JOIN agent_runtime r ON r.id = c.runtime_id
+LEFT JOIN runtime_load rl ON rl.runtime_id = c.runtime_id
 ORDER BY
+    (r.status = 'online' AND c.runtime_id IN (SELECT runtime_id FROM active_overrides)) DESC,
     (r.status = 'online') DESC,
     COALESCE(rl.tokens_7d, 0) ASC,
     rl.last_used_at ASC NULLS FIRST
