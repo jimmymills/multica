@@ -292,7 +292,14 @@ func (h *Handler) SetRuntimeGroupOverride(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "failed to set override")
 		return
 	}
-	group, _ := h.Queries.GetRuntimeGroup(r.Context(), parseUUID(id))
+	group, err := h.Queries.GetRuntimeGroupInWorkspace(r.Context(), db.GetRuntimeGroupInWorkspaceParams{
+		ID:          parseUUID(id),
+		WorkspaceID: parseUUID(workspaceID),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to fetch runtime group")
+		return
+	}
 	resp, err := h.buildRuntimeGroupResponse(r.Context(), group)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to build response")
