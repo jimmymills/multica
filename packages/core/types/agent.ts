@@ -22,6 +22,17 @@ export interface RuntimeDevice {
 
 export type AgentRuntime = RuntimeDevice;
 
+export interface AgentRuntimeRef {
+  id: string;
+  name: string;
+  status: "online" | "offline";
+  runtime_mode: AgentRuntimeMode;
+  provider: string;
+  device_info: string;
+  owner_id: string | null;
+  last_used_at: string | null;
+}
+
 export interface AgentTask {
   id: string;
   agent_id: string;
@@ -40,7 +51,8 @@ export interface AgentTask {
 export interface Agent {
   id: string;
   workspace_id: string;
-  runtime_id: string;
+  runtime_ids: string[];
+  runtimes: AgentRuntimeRef[];
   name: string;
   description: string;
   instructions: string;
@@ -66,7 +78,7 @@ export interface CreateAgentRequest {
   description?: string;
   instructions?: string;
   avatar_url?: string;
-  runtime_id: string;
+  runtime_ids: string[];
   runtime_config?: Record<string, unknown>;
   custom_env?: Record<string, string>;
   custom_args?: string[];
@@ -79,7 +91,7 @@ export interface UpdateAgentRequest {
   description?: string;
   instructions?: string;
   avatar_url?: string;
-  runtime_id?: string;
+  runtime_ids?: string[];
   runtime_config?: Record<string, unknown>;
   custom_env?: Record<string, string>;
   custom_args?: string[];

@@ -74,10 +74,16 @@ ORDER BY created_at ASC;
 DELETE FROM agent_runtime WHERE id = $1;
 
 -- name: CountActiveAgentsByRuntime :one
-SELECT count(*) FROM agent WHERE runtime_id = $1 AND archived_at IS NULL;
+SELECT count(*) FROM agent a
+JOIN agent_runtime_assignment ara ON ara.agent_id = a.id
+WHERE ara.runtime_id = $1 AND a.archived_at IS NULL;
 
 -- name: DeleteArchivedAgentsByRuntime :exec
-DELETE FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL;
+DELETE FROM agent WHERE id IN (
+    SELECT a.id FROM agent a
+    JOIN agent_runtime_assignment ara ON ara.agent_id = a.id
+    WHERE ara.runtime_id = $1 AND a.archived_at IS NOT NULL
+);
 
 -- name: FindLegacyRuntimesByDaemonID :many
 -- Looks up runtime rows keyed on a prior (hostname-derived) daemon_id. Used
@@ -100,11 +106,18 @@ WHERE workspace_id = @workspace_id
   AND provider = @provider
   AND LOWER(daemon_id) = LOWER(@daemon_id);
 
--- name: ReassignAgentsToRuntime :execrows
--- Re-points every agent referencing old_runtime_id at new_runtime_id.
-UPDATE agent
-SET runtime_id = @new_runtime_id
-WHERE runtime_id = @old_runtime_id;
+-- name: CopyAgentAssignmentsForRuntimeMerge :execrows
+-- Re-points every assignment referencing old_runtime_id at new_runtime_id.
+-- ON CONFLICT keeps the existing row when the agent already has an
+-- assignment to new_runtime_id. Orphan rows (old_runtime_id rows after the
+-- copy) are removed by DeleteAgentAssignmentsForRuntime.
+INSERT INTO agent_runtime_assignment (agent_id, runtime_id)
+SELECT ara.agent_id, @new_runtime_id FROM agent_runtime_assignment ara
+WHERE ara.runtime_id = @old_runtime_id
+ON CONFLICT (agent_id, runtime_id) DO NOTHING;
+
+-- name: DeleteAgentAssignmentsForRuntime :exec
+DELETE FROM agent_runtime_assignment WHERE runtime_id = $1;
 
 -- name: ReassignTasksToRuntime :execrows
 -- Re-points every queued/running/completed task referencing old_runtime_id.
@@ -125,10 +138,10 @@ WHERE id = $1;
 
 -- name: DeleteStaleOfflineRuntimes :many
 -- Deletes runtimes that have been offline for longer than the TTL and have
--- no agents bound (active or archived). The FK constraint on agent.runtime_id
--- is ON DELETE RESTRICT, so we must exclude all agent references.
+-- no agent assignments. The FK constraint on agent_runtime_assignment.runtime_id
+-- is ON DELETE RESTRICT, so we must exclude all referenced runtimes.
 DELETE FROM agent_runtime
 WHERE status = 'offline'
   AND last_seen_at < now() - make_interval(secs => @stale_seconds::double precision)
-  AND id NOT IN (SELECT DISTINCT runtime_id FROM agent)
+  AND id NOT IN (SELECT DISTINCT runtime_id FROM agent_runtime_assignment)
 RETURNING id, workspace_id;

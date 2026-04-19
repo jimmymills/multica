@@ -19,11 +19,31 @@ interface TestWorkspace {
   slug: string;
 }
 
+interface TestRuntime {
+  id: string;
+  name: string;
+  status: string;
+}
+
+interface TestAgent {
+  id: string;
+  name: string;
+}
+
+interface TestTask {
+  id: string;
+  runtime_id: string;
+  issue_id: string;
+  status: string;
+}
+
 export class TestApiClient {
   private token: string | null = null;
   private workspaceSlug: string | null = null;
   private workspaceId: string | null = null;
   private createdIssueIds: string[] = [];
+  private createdAgentIds: string[] = [];
+  private createdRuntimeIds: string[] = [];
 
   async login(email: string, name: string) {
     const client = new pg.Client(DATABASE_URL);
@@ -123,6 +143,73 @@ export class TestApiClient {
     throw new Error(`Failed to ensure workspace ${slug}: ${res.status} ${res.statusText}`);
   }
 
+  /**
+   * Insert a test agent_runtime row directly into the database.
+   * Runtimes are normally registered by the daemon via heartbeat; there is no
+   * user-facing REST endpoint to create them, so we use direct DB access here.
+   * Each call generates a unique daemon_id so the UNIQUE (workspace_id, daemon_id, provider)
+   * constraint is satisfied.
+   */
+  async createRuntime(opts: { status?: "online" | "offline"; name?: string } = {}): Promise<TestRuntime> {
+    if (!this.workspaceId) throw new Error("workspaceId not set — call ensureWorkspace first");
+    const status = opts.status ?? "online";
+    const name = opts.name ?? `E2E Runtime ${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const daemonId = `e2e-daemon-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+    const client = new pg.Client(DATABASE_URL);
+    await client.connect();
+    try {
+      const result = await client.query<TestRuntime>(
+        `INSERT INTO agent_runtime (workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at)
+         VALUES ($1, $2, $3, 'local', 'claude', $4, 'E2E test device', '{}', now())
+         RETURNING id, name, status`,
+        [this.workspaceId, daemonId, name, status],
+      );
+      this.createdRuntimeIds.push(result.rows[0].id);
+      return result.rows[0];
+    } finally {
+      await client.end();
+    }
+  }
+
+  /**
+   * Create an agent via the REST API with one or more runtime assignments.
+   * Tracks the created agent for cleanup.
+   */
+  async createAgent(opts: { name?: string; runtime_ids: string[] }): Promise<TestAgent> {
+    const name = opts.name ?? `E2E Agent ${Date.now()}`;
+    const res = await this.authedFetch("/api/agents", {
+      method: "POST",
+      body: JSON.stringify({
+        name,
+        runtime_ids: opts.runtime_ids,
+        visibility: "private",
+        max_concurrent_tasks: 6,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`createAgent failed: ${res.status} ${body}`);
+    }
+    const agent = (await res.json()) as TestAgent;
+    this.createdAgentIds.push(agent.id);
+    return agent;
+  }
+
+  /**
+   * Fetch the most recent task queued/dispatched for an issue.
+   * Uses GET /api/issues/{id}/task-runs which returns all tasks sorted newest-first.
+   */
+  async getLatestTaskForIssue(issueId: string): Promise<TestTask> {
+    const res = await this.authedFetch(`/api/issues/${issueId}/task-runs`);
+    if (!res.ok) {
+      throw new Error(`getLatestTaskForIssue failed: ${res.status}`);
+    }
+    const tasks = (await res.json()) as TestTask[];
+    if (tasks.length === 0) throw new Error(`No tasks found for issue ${issueId}`);
+    return tasks[0];
+  }
+
   async createIssue(title: string, opts?: Record<string, unknown>) {
     const res = await this.authedFetch("/api/issues", {
       method: "POST",
@@ -137,7 +224,7 @@ export class TestApiClient {
     await this.authedFetch(`/api/issues/${id}`, { method: "DELETE" });
   }
 
-  /** Clean up all issues created during this test. */
+  /** Clean up all issues, agents, and runtimes created during this test. */
   async cleanup() {
     for (const id of this.createdIssueIds) {
       try {
@@ -147,6 +234,32 @@ export class TestApiClient {
       }
     }
     this.createdIssueIds = [];
+
+    for (const id of this.createdAgentIds) {
+      try {
+        await this.authedFetch(`/api/agents/${id}/archive`, { method: "POST" });
+      } catch {
+        /* ignore */
+      }
+    }
+    this.createdAgentIds = [];
+
+    if (this.createdRuntimeIds.length > 0) {
+      const client = new pg.Client(DATABASE_URL);
+      await client.connect();
+      try {
+        for (const id of this.createdRuntimeIds) {
+          try {
+            await client.query("DELETE FROM agent_runtime WHERE id = $1", [id]);
+          } catch {
+            /* ignore */
+          }
+        }
+      } finally {
+        await client.end();
+      }
+      this.createdRuntimeIds = [];
+    }
   }
 
   getToken() {

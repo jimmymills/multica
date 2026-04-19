@@ -33,7 +33,6 @@ type Agent struct {
 	CreatedAt          pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
 	Description        string             `json:"description"`
-	RuntimeID          pgtype.UUID        `json:"runtime_id"`
 	Instructions       string             `json:"instructions"`
 	ArchivedAt         pgtype.Timestamptz `json:"archived_at"`
 	ArchivedBy         pgtype.UUID        `json:"archived_by"`
@@ -56,6 +55,12 @@ type AgentRuntime struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	OwnerID        pgtype.UUID        `json:"owner_id"`
 	LegacyDaemonID pgtype.Text        `json:"legacy_daemon_id"`
+}
+
+type AgentRuntimeAssignment struct {
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	RuntimeID pgtype.UUID        `json:"runtime_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type AgentSkill struct {

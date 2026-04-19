@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
-import { Cloud, ChevronDown, Globe, Lock, Loader2 } from "lucide-react";
+import { useState, useMemo } from "react";
+import { Globe, Lock, Loader2 } from "lucide-react";
 import { ProviderLogo } from "../../runtimes/components/provider-logo";
 import { ActorAvatar } from "../../common/actor-avatar";
 import type {
@@ -49,7 +49,7 @@ export function CreateAgentDialog({
   const [description, setDescription] = useState("");
   const [visibility, setVisibility] = useState<AgentVisibility>("private");
   const [creating, setCreating] = useState(false);
-  const [runtimeOpen, setRuntimeOpen] = useState(false);
+  const [addRuntimeOpen, setAddRuntimeOpen] = useState(false);
   const [runtimeFilter, setRuntimeFilter] = useState<RuntimeFilter>("mine");
 
   const getOwnerMember = (ownerId: string | null) => {
@@ -70,24 +70,32 @@ export function CreateAgentDialog({
     });
   }, [runtimes, runtimeFilter, currentUserId]);
 
-  const [selectedRuntimeId, setSelectedRuntimeId] = useState(filteredRuntimes[0]?.id ?? "");
+  const [selectedRuntimeIds, setSelectedRuntimeIds] = useState<string[]>(() =>
+    filteredRuntimes[0] ? [filteredRuntimes[0].id] : [],
+  );
 
-  useEffect(() => {
-    if (!selectedRuntimeId && filteredRuntimes[0]) {
-      setSelectedRuntimeId(filteredRuntimes[0].id);
-    }
-  }, [filteredRuntimes, selectedRuntimeId]);
+  const selectedRuntimes = useMemo(
+    () => selectedRuntimeIds
+      .map((id) => runtimes.find((r) => r.id === id))
+      .filter((r): r is RuntimeDevice => Boolean(r)),
+    [selectedRuntimeIds, runtimes],
+  );
 
-  const selectedRuntime = runtimes.find((d) => d.id === selectedRuntimeId) ?? null;
+  const candidateRuntimes = useMemo(
+    () => filteredRuntimes.filter((r) => !selectedRuntimeIds.includes(r.id)),
+    [filteredRuntimes, selectedRuntimeIds],
+  );
+
+  const canSubmit = !creating && name.trim().length > 0 && selectedRuntimeIds.length > 0;
 
   const handleSubmit = async () => {
-    if (!name.trim() || !selectedRuntime) return;
+    if (!canSubmit) return;
     setCreating(true);
     try {
       await onCreate({
         name: name.trim(),
         description: description.trim(),
-        runtime_id: selectedRuntime.id,
+        runtime_ids: selectedRuntimeIds,
         visibility,
       });
       onClose();
@@ -170,12 +178,12 @@ export function CreateAgentDialog({
 
           <div className="min-w-0">
             <div className="flex items-center justify-between">
-              <Label className="text-xs text-muted-foreground">Runtime</Label>
+              <Label className="text-xs text-muted-foreground">Runtimes</Label>
               {hasOtherRuntimes && (
                 <div className="flex items-center gap-0.5 rounded-md bg-muted p-0.5">
                   <button
                     type="button"
-                    onClick={() => { setRuntimeFilter("mine"); setSelectedRuntimeId(""); }}
+                    onClick={() => setRuntimeFilter("mine")}
                     className={`rounded px-2 py-0.5 text-xs font-medium transition-colors ${
                       runtimeFilter === "mine"
                         ? "bg-background text-foreground shadow-sm"
@@ -186,7 +194,7 @@ export function CreateAgentDialog({
                   </button>
                   <button
                     type="button"
-                    onClick={() => { setRuntimeFilter("all"); setSelectedRuntimeId(""); }}
+                    onClick={() => setRuntimeFilter("all")}
                     className={`rounded px-2 py-0.5 text-xs font-medium transition-colors ${
                       runtimeFilter === "all"
                         ? "bg-background text-foreground shadow-sm"
@@ -198,82 +206,105 @@ export function CreateAgentDialog({
                 </div>
               )}
             </div>
-            <Popover open={runtimeOpen} onOpenChange={setRuntimeOpen}>
-              <PopoverTrigger
-                disabled={runtimes.length === 0 && !runtimesLoading}
-                className="flex w-full min-w-0 items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 mt-1.5 text-left text-sm transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
-              >
-                {runtimesLoading ? (
-                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
-                ) : selectedRuntime ? (
-                  <ProviderLogo provider={selectedRuntime.provider} className="h-4 w-4 shrink-0" />
-                ) : (
-                  <Cloud className="h-4 w-4 shrink-0 text-muted-foreground" />
-                )}
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="truncate font-medium">
-                      {runtimesLoading ? "Loading runtimes..." : (selectedRuntime?.name ?? "No runtime available")}
-                    </span>
-                    {selectedRuntime?.runtime_mode === "cloud" && (
+
+            {runtimesLoading ? (
+              <div className="mt-1.5 flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2.5 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                Loading runtimes…
+              </div>
+            ) : (
+              <div className="mt-1.5 flex flex-wrap gap-2">
+                {selectedRuntimes.map((device) => (
+                  <div
+                    key={device.id}
+                    className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm"
+                  >
+                    <ProviderLogo provider={device.provider} className="h-4 w-4 shrink-0" />
+                    <span className="truncate font-medium">{device.name}</span>
+                    {device.runtime_mode === "cloud" && (
                       <span className="shrink-0 rounded bg-info/10 px-1.5 py-0.5 text-xs font-medium text-info">
                         Cloud
                       </span>
                     )}
-                  </div>
-                  <div className="truncate text-xs text-muted-foreground">
-                    {selectedRuntime
-                      ? (getOwnerMember(selectedRuntime.owner_id)?.name ?? selectedRuntime.device_info)
-                      : "Register a runtime before creating an agent"}
-                  </div>
-                </div>
-                <ChevronDown className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${runtimeOpen ? "rotate-180" : ""}`} />
-              </PopoverTrigger>
-              <PopoverContent align="start" className="w-[var(--anchor-width)] p-1 max-h-60 overflow-y-auto">
-                {filteredRuntimes.map((device) => {
-                  const ownerMember = getOwnerMember(device.owner_id);
-                  return (
-                    <button
-                      key={device.id}
-                      onClick={() => {
-                        setSelectedRuntimeId(device.id);
-                        setRuntimeOpen(false);
-                      }}
-                      className={`flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm transition-colors ${
-                        device.id === selectedRuntimeId ? "bg-accent" : "hover:bg-accent/50"
+                    <span
+                      className={`h-2 w-2 shrink-0 rounded-full ${
+                        device.status === "online" ? "bg-success" : "bg-muted-foreground/40"
                       }`}
+                    />
+                    <button
+                      type="button"
+                      aria-label={`Remove ${device.name}`}
+                      onClick={() =>
+                        setSelectedRuntimeIds((ids) => ids.filter((id) => id !== device.id))
+                      }
+                      className="ml-1 text-muted-foreground hover:text-foreground"
                     >
-                      <ProviderLogo provider={device.provider} className="h-4 w-4 shrink-0" />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate font-medium">{device.name}</span>
-                          {device.runtime_mode === "cloud" && (
-                            <span className="shrink-0 rounded bg-info/10 px-1.5 py-0.5 text-xs font-medium text-info">
-                              Cloud
-                            </span>
-                          )}
-                        </div>
-                        <div className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
-                          {ownerMember ? (
-                            <>
-                              <ActorAvatar actorType="member" actorId={ownerMember.user_id} size={14} />
-                              <span className="truncate">{ownerMember.name}</span>
-                            </>
-                          ) : (
-                            <span className="truncate">{device.device_info}</span>
-                          )}
-                        </div>
-                      </div>
-                      <span
-                        className={`h-2 w-2 shrink-0 rounded-full ${
-                          device.status === "online" ? "bg-success" : "bg-muted-foreground/40"
-                        }`}
-                      />
+                      ×
                     </button>
-                  );
-                })}
-              </PopoverContent>
-            </Popover>
+                  </div>
+                ))}
+
+                <Popover open={addRuntimeOpen} onOpenChange={setAddRuntimeOpen}>
+                  <PopoverTrigger
+                    disabled={candidateRuntimes.length === 0}
+                    className="rounded-lg border border-dashed border-border bg-background px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+                  >
+                    + Add runtime
+                  </PopoverTrigger>
+                  <PopoverContent align="start" className="w-72 p-1 max-h-60 overflow-y-auto">
+                    {candidateRuntimes.map((device) => {
+                      const ownerMember = getOwnerMember(device.owner_id);
+                      return (
+                        <button
+                          key={device.id}
+                          role="menuitem"
+                          onClick={() => {
+                            setSelectedRuntimeIds((ids) => [...ids, device.id]);
+                            setAddRuntimeOpen(false);
+                          }}
+                          className="flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm hover:bg-accent/50"
+                        >
+                          <ProviderLogo provider={device.provider} className="h-4 w-4 shrink-0" />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <span className="truncate font-medium">{device.name}</span>
+                              {device.runtime_mode === "cloud" && (
+                                <span className="shrink-0 rounded bg-info/10 px-1.5 py-0.5 text-xs font-medium text-info">
+                                  Cloud
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-0.5 flex items-center gap-1 text-xs text-muted-foreground">
+                              {ownerMember ? (
+                                <>
+                                  <ActorAvatar actorType="member" actorId={ownerMember.user_id} size={14} />
+                                  <span className="truncate">{ownerMember.name}</span>
+                                </>
+                              ) : (
+                                <span className="truncate">{device.device_info}</span>
+                              )}
+                            </div>
+                          </div>
+                          <span
+                            className={`h-2 w-2 shrink-0 rounded-full ${
+                              device.status === "online" ? "bg-success" : "bg-muted-foreground/40"
+                            }`}
+                          />
+                        </button>
+                      );
+                    })}
+                  </PopoverContent>
+                </Popover>
+              </div>
+            )}
+
+            {!runtimesLoading && selectedRuntimeIds.length === 0 && (
+              <p className="mt-2 text-xs text-destructive">
+                {runtimes.length === 0
+                  ? "Register a runtime before creating an agent."
+                  : "At least one runtime is required."}
+              </p>
+            )}
           </div>
         </div>
 
@@ -281,10 +312,7 @@ export function CreateAgentDialog({
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button
-            onClick={handleSubmit}
-            disabled={creating || !name.trim() || !selectedRuntime}
-          >
+          <Button onClick={handleSubmit} disabled={!canSubmit}>
             {creating ? "Creating..." : "Create"}
           </Button>
         </DialogFooter>
