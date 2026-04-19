@@ -68,11 +68,18 @@ export function RuntimeGroupDetail({
     [runtimes, selectedRuntimeIds],
   );
 
+  const originalRuntimeIds = useMemo(
+    () => new Set(group.runtimes.map((r) => r.id)),
+    [group.runtimes],
+  );
+  const runtimesDirty =
+    selectedRuntimeIds.length !== originalRuntimeIds.size ||
+    selectedRuntimeIds.some((id) => !originalRuntimeIds.has(id));
+
   const dirty =
     name !== group.name ||
     description !== group.description ||
-    selectedRuntimeIds.length !== group.runtimes.length ||
-    selectedRuntimeIds.some((id, i) => id !== group.runtimes[i]?.id);
+    runtimesDirty;
 
   const canSave = dirty && !saving && name.trim().length > 0 && selectedRuntimeIds.length > 0;
 
@@ -225,7 +232,11 @@ export function RuntimeGroupDetail({
       {confirmDelete && (
         <ConfirmDialog
           title={`Delete ${group.name}?`}
-          description="This removes the group from every agent using it. Member runtimes and agents are not deleted."
+          description={
+            group.member_agent_count === 0
+              ? "This permanently deletes the group."
+              : `This removes the group from ${group.member_agent_count} agent${group.member_agent_count === 1 ? "" : "s"}. If any of them rely solely on this group, new tasks will fail to enqueue until you reassign runtimes.`
+          }
           onCancel={() => setConfirmDelete(false)}
           onConfirm={async () => {
             await onDelete();

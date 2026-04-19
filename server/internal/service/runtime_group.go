@@ -130,6 +130,10 @@ func (s *RuntimeGroupService) UpdateGroup(ctx context.Context, groupID pgtype.UU
 	return group, nil
 }
 
+// ErrRuntimeGroupNotFound is returned by SetOverride when the group has been
+// deleted between the handler's pre-check and the service transaction.
+var ErrRuntimeGroupNotFound = errors.New("runtime group not found")
+
 // ErrRuntimeNotGroupMember is returned by SetOverride when the requested
 // runtime is not a current member of the group.
 var ErrRuntimeNotGroupMember = errors.New("runtime is not a member of this group")
@@ -145,6 +149,13 @@ func (s *RuntimeGroupService) SetOverride(ctx context.Context, groupID, runtimeI
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+
+	if _, err := qtx.GetRuntimeGroup(ctx, groupID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return db.RuntimeGroupOverride{}, ErrRuntimeGroupNotFound
+		}
+		return db.RuntimeGroupOverride{}, fmt.Errorf("get group: %w", err)
+	}
 
 	if err := qtx.ClipActiveRuntimeGroupOverride(ctx, groupID); err != nil {
 		return db.RuntimeGroupOverride{}, fmt.Errorf("clip active: %w", err)

@@ -285,6 +285,10 @@ func (h *Handler) SetRuntimeGroupOverride(w http.ResponseWriter, r *http.Request
 	endsAt := pgtype.Timestamptz{Time: req.EndsAt, Valid: true}
 	_, err := h.RuntimeGroupService.SetOverride(r.Context(), parseUUID(id), parseUUID(req.RuntimeID), endsAt, parseUUID(userID))
 	if err != nil {
+		if errors.Is(err, service.ErrRuntimeGroupNotFound) {
+			writeError(w, http.StatusNotFound, "runtime group not found")
+			return
+		}
 		if errors.Is(err, service.ErrRuntimeNotGroupMember) {
 			writeError(w, http.StatusBadRequest, "runtime is not a member of this group")
 			return

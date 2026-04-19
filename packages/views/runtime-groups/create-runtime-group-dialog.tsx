@@ -65,6 +65,7 @@ export function CreateRuntimeGroupDialog({
       });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to create group");
+    } finally {
       setSaving(false);
     }
   };

@@ -18,6 +18,7 @@ import { runtimeListOptions } from "@multica/core/runtimes/queries";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { agentListOptions, memberListOptions, workspaceKeys } from "@multica/core/workspace/queries";
+import { runtimeGroupKeys } from "../../runtime-groups/runtime-groups-list-page";
 import { PageHeader } from "../../layout/page-header";
 import { CreateAgentDialog } from "./create-agent-dialog";
 import { AgentListItem } from "./agent-list-item";
@@ -34,7 +35,7 @@ export function AgentsPage() {
   const { data: runtimes = [], isLoading: runtimesLoading } = useQuery(runtimeListOptions(wsId));
   const { data: members = [] } = useQuery(memberListOptions(wsId));
   const { data: groups = [] } = useQuery({
-    queryKey: ["runtime-groups", wsId],
+    queryKey: runtimeGroupKeys.list(wsId),
     queryFn: () => api.listRuntimeGroups(wsId),
   });
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
