@@ -117,13 +117,21 @@ func setupHandlerTestFixture(ctx context.Context, pool *pgxpool.Pool) (string, s
 	}
 	testRuntimeID = runtimeID
 
-	if _, err := pool.Exec(ctx, `
+	var agentID string
+	if err := pool.QueryRow(ctx, `
 		INSERT INTO agent (
 			workspace_id, name, description, runtime_mode, runtime_config,
-			runtime_id, visibility, max_concurrent_tasks, owner_id
+			visibility, max_concurrent_tasks, owner_id
 		)
-		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'workspace', 1, $4)
-	`, workspaceID, "Handler Test Agent", runtimeID, userID); err != nil {
+		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, 'workspace', 1, $3)
+		RETURNING id
+	`, workspaceID, "Handler Test Agent", userID).Scan(&agentID); err != nil {
+		return "", "", err
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO agent_runtime_assignment (agent_id, runtime_id)
+		VALUES ($1, $2)
+	`, agentID, runtimeID); err != nil {
 		return "", "", err
 	}
 
@@ -890,9 +898,11 @@ func TestResolveActor(t *testing.T) {
 		t.Fatalf("failed to create test issue: %v", err)
 	}
 
-	// Look up runtime_id for the agent.
+	// Look up the first runtime_id assigned to the agent.
 	var runtimeID string
-	err = testPool.QueryRow(ctx, `SELECT runtime_id FROM agent WHERE id = $1`, agentID).Scan(&runtimeID)
+	err = testPool.QueryRow(ctx,
+		`SELECT runtime_id FROM agent_runtime_assignment WHERE agent_id = $1 LIMIT 1`, agentID,
+	).Scan(&runtimeID)
 	if err != nil {
 		t.Fatalf("failed to get agent runtime_id: %v", err)
 	}
@@ -1084,6 +1094,93 @@ func TestBacklogToTodoTriggersAgent(t *testing.T) {
 	cleanupReq := newRequest("DELETE", "/api/issues/"+created.ID, nil)
 	cleanupReq = withURLParam(cleanupReq, "id", created.ID)
 	testHandler.DeleteIssue(httptest.NewRecorder(), cleanupReq)
+}
+
+// createSecondRuntimeInTestWorkspace inserts a second agent_runtime in the test
+// workspace and returns its UUID string. The caller must clean it up.
+func createSecondRuntimeInTestWorkspace(t *testing.T) string {
+	t.Helper()
+	var id string
+	err := testPool.QueryRow(context.Background(), `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at
+		)
+		VALUES ($1, NULL, $2, 'cloud', 'handler_test_runtime2', 'online', 'Handler test runtime 2', '{}'::jsonb, now())
+		RETURNING id
+	`, testWorkspaceID, "Handler Test Runtime 2").Scan(&id)
+	if err != nil {
+		t.Fatalf("createSecondRuntimeInTestWorkspace: %v", err)
+	}
+	return id
+}
+
+// createRuntimeInOtherWorkspace creates a separate workspace and a runtime
+// inside it, returning the runtime UUID string. The caller must clean up the
+// runtime row; the workspace is cleaned up by cleaning up its cascade.
+func createRuntimeInOtherWorkspace(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+
+	var wsID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO workspace (name, slug, description, issue_prefix)
+		VALUES ('Foreign WS', 'foreign-ws-handler-test', '', 'FWH')
+		RETURNING id
+	`).Scan(&wsID); err != nil {
+		t.Fatalf("createRuntimeInOtherWorkspace: create workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, wsID)
+	})
+
+	var runtimeID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_runtime (
+			workspace_id, daemon_id, name, runtime_mode, provider, status, device_info, metadata, last_seen_at
+		)
+		VALUES ($1, NULL, 'Foreign Runtime', 'cloud', 'foreign_rt', 'online', '', '{}'::jsonb, now())
+		RETURNING id
+	`, wsID).Scan(&runtimeID); err != nil {
+		t.Fatalf("createRuntimeInOtherWorkspace: create runtime: %v", err)
+	}
+	return runtimeID
+}
+
+// createAgentWithRuntimes creates an agent in the test workspace assigned to
+// the given runtimeIDs. Returns the agent UUID string.
+func createAgentWithRuntimes(t *testing.T, runtimeIDs []string) string {
+	t.Helper()
+	ctx := context.Background()
+
+	var agentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent (
+			workspace_id, name, description, runtime_mode, runtime_config,
+			visibility, max_concurrent_tasks, owner_id
+		) VALUES ($1, $2, '', 'cloud', '{}'::jsonb, 'private', 1, $3)
+		RETURNING id
+	`, testWorkspaceID, "test-agent-"+runtimeIDs[0][:8], testUserID).Scan(&agentID); err != nil {
+		t.Fatalf("createAgentWithRuntimes: insert agent: %v", err)
+	}
+
+	for _, rid := range runtimeIDs {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO agent_runtime_assignment (agent_id, runtime_id)
+			VALUES ($1, $2)
+			ON CONFLICT DO NOTHING
+		`, agentID, rid); err != nil {
+			t.Fatalf("createAgentWithRuntimes: insert assignment: %v", err)
+		}
+	}
+
+	return agentID
+}
+
+// newAuthedRequestWithPath creates a request with the standard auth headers and
+// a chi URL parameter named "id" set to agentID.
+func newAuthedRequestWithPath(method, path string, body any, agentID string) *http.Request {
+	req := newRequest(method, path, body)
+	return withURLParam(req, "id", agentID)
 }
 
 func TestDaemonRegisterMissingWorkspaceReturns404(t *testing.T) {
