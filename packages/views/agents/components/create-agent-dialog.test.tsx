@@ -10,6 +10,7 @@ const runtime = (overrides: Partial<RuntimeDevice> = {}): RuntimeDevice => ({
   name: "Workstation",
   runtime_mode: "local",
   provider: "claude",
+  launch_header: "",
   status: "online",
   device_info: "macOS",
   metadata: {},

@@ -194,6 +194,7 @@ describe("TasksTab", () => {
         name: "Laptop Runtime",
         runtime_mode: "local",
         provider: "claude",
+        launch_header: "",
         status: "online",
         device_info: "macOS",
         metadata: {},

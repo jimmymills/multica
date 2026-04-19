@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -51,7 +53,9 @@ type AgentResponse struct {
 	RuntimeConfig      any                    `json:"runtime_config"`
 	CustomEnv          map[string]string      `json:"custom_env"`
 	CustomArgs         []string               `json:"custom_args"`
+	McpConfig          json.RawMessage        `json:"mcp_config"`
 	CustomEnvRedacted  bool                   `json:"custom_env_redacted"`
+	McpConfigRedacted  bool                   `json:"mcp_config_redacted"`
 	Visibility         string                 `json:"visibility"`
 	Status             string                 `json:"status"`
 	MaxConcurrentTasks int32                  `json:"max_concurrent_tasks"`
@@ -95,6 +99,11 @@ func agentToResponse(a db.Agent) AgentResponse {
 		customArgs = []string{}
 	}
 
+	var mcpConfig json.RawMessage
+	if a.McpConfig != nil {
+		mcpConfig = json.RawMessage(a.McpConfig)
+	}
+
 	return AgentResponse{
 		ID:                 uuidToString(a.ID),
 		WorkspaceID:        uuidToString(a.WorkspaceID),
@@ -106,6 +115,7 @@ func agentToResponse(a db.Agent) AgentResponse {
 		RuntimeConfig:      rc,
 		CustomEnv:          customEnv,
 		CustomArgs:         customArgs,
+		McpConfig:          mcpConfig,
 		Visibility:         a.Visibility,
 		Status:             a.Status,
 		MaxConcurrentTasks: a.MaxConcurrentTasks,
@@ -225,6 +235,7 @@ type TaskAgentData struct {
 	Skills       []service.AgentSkillData `json:"skills,omitempty"`
 	CustomEnv    map[string]string        `json:"custom_env,omitempty"`
 	CustomArgs   []string                 `json:"custom_args,omitempty"`
+	McpConfig    json.RawMessage          `json:"mcp_config,omitempty"`
 }
 
 func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
@@ -358,9 +369,10 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		if grps := groupsByAgent[aid]; grps != nil {
 			resp.Groups = grps
 		}
-		// Redact custom_env for users who are not the agent owner or workspace owner/admin.
+		// Redact sensitive fields for users who are not the agent owner or workspace owner/admin.
 		if !canViewAgentEnv(a, userID, member.Role) {
 			redactEnv(&resp)
+			redactMcpConfig(&resp)
 		}
 		visible = append(visible, resp)
 	}
@@ -380,11 +392,12 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Redact custom_env for users who are not the agent owner or workspace owner/admin.
+	// Redact sensitive fields for users who are not the agent owner or workspace owner/admin.
 	userID := requestUserID(r)
 	if member, ok := ctxMember(r.Context()); ok {
 		if !canViewAgentEnv(agent, userID, member.Role) {
 			redactEnv(&resp)
+			redactMcpConfig(&resp)
 		}
 	}
 
@@ -401,15 +414,38 @@ type CreateAgentRequest struct {
 	RuntimeConfig      any               `json:"runtime_config"`
 	CustomEnv          map[string]string `json:"custom_env"`
 	CustomArgs         []string          `json:"custom_args"`
+	McpConfig          json.RawMessage   `json:"mcp_config"`
 	Visibility         string            `json:"visibility"`
 	MaxConcurrentTasks int32             `json:"max_concurrent_tasks"`
+}
+
+func decodeJSONBodyWithRawFields(body io.Reader, dst any) (map[string]json.RawMessage, error) {
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := json.Unmarshal(payload, dst); err != nil {
+		return nil, err
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		raw = map[string]json.RawMessage{}
+	}
+
+	return raw, nil
 }
 
 func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	workspaceID := h.resolveWorkspaceID(r)
 
 	var req CreateAgentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	rawFields, err := decodeJSONBodyWithRawFields(r.Body, &req)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -488,6 +524,11 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		ca = []byte("[]")
 	}
 
+	var mc []byte
+	if rawMcpConfig, ok := rawFields["mcp_config"]; ok && !bytes.Equal(bytes.TrimSpace(rawMcpConfig), []byte("null")) {
+		mc = append([]byte(nil), rawMcpConfig...)
+	}
+
 	// Create agent + assignments in a single transaction.
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
@@ -511,6 +552,7 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		OwnerID:            parseUUID(ownerID),
 		CustomEnv:          ce,
 		CustomArgs:         ca,
+		McpConfig:          mc,
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -590,6 +632,7 @@ type UpdateAgentRequest struct {
 	RuntimeConfig      any                `json:"runtime_config"`
 	CustomEnv          *map[string]string `json:"custom_env"`
 	CustomArgs         *[]string          `json:"custom_args"`
+	McpConfig          *json.RawMessage   `json:"mcp_config"`
 	Visibility         *string            `json:"visibility"`
 	Status             *string            `json:"status"`
 	MaxConcurrentTasks *int32             `json:"max_concurrent_tasks"`
@@ -615,6 +658,16 @@ func redactEnv(resp *AgentResponse) {
 	}
 	resp.CustomEnv = masked
 	resp.CustomEnvRedacted = true
+}
+
+// redactMcpConfig removes the mcp_config value from the response when the caller is not
+// authorised to view it. The field is set to null; McpConfigRedacted is set to true so
+// callers know a config exists without seeing its contents (which may contain secrets).
+func redactMcpConfig(resp *AgentResponse) {
+	if resp.McpConfig != nil {
+		resp.McpConfig = nil
+		resp.McpConfigRedacted = true
+	}
 }
 
 // canManageAgent checks whether the current user can update or archive an agent.
@@ -646,7 +699,8 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req UpdateAgentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	rawFields, err := decodeJSONBodyWithRawFields(r.Body, &req)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -719,6 +773,11 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if req.CustomArgs != nil {
 		ca, _ := json.Marshal(*req.CustomArgs)
 		params.CustomArgs = ca
+	}
+	rawMcpConfig, hasMcpConfig := rawFields["mcp_config"]
+	shouldClearMcpConfig := hasMcpConfig && bytes.Equal(bytes.TrimSpace(rawMcpConfig), []byte("null"))
+	if hasMcpConfig && !shouldClearMcpConfig {
+		params.McpConfig = append([]byte(nil), rawMcpConfig...)
 	}
 	if req.RuntimeIDs != nil && len(runtimeUUIDs) > 0 && primaryMode != "" {
 		params.RuntimeMode = pgtype.Text{String: primaryMode, Valid: true}
@@ -800,6 +859,17 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			slog.Warn("prune agent runtime assignments failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to prune runtime assignments")
+			return
+		}
+	}
+
+	// mcp_config: null in the request means explicitly clear the field.
+	// COALESCE in UpdateAgent cannot set a column to NULL, so we use a dedicated query.
+	if shouldClearMcpConfig {
+		agent, err = qtx.ClearAgentMcpConfig(r.Context(), parseUUID(id))
+		if err != nil {
+			slog.Warn("clear agent mcp_config failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+			writeError(w, http.StatusInternalServerError, "failed to clear mcp_config: "+err.Error())
 			return
 		}
 	}
