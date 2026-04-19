@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,10 +17,20 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
+type AgentRuntimeRef struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Status      string  `json:"status"`
+	RuntimeMode string  `json:"runtime_mode"`
+	Provider    string  `json:"provider"`
+	DeviceInfo  string  `json:"device_info"`
+	OwnerID     *string `json:"owner_id"`
+	LastUsedAt  *string `json:"last_used_at"`
+}
+
 type AgentResponse struct {
 	ID                 string            `json:"id"`
 	WorkspaceID        string            `json:"workspace_id"`
-	RuntimeID          string            `json:"runtime_id"`
 	Name               string            `json:"name"`
 	Description        string            `json:"description"`
 	Instructions       string            `json:"instructions"`
@@ -34,6 +45,7 @@ type AgentResponse struct {
 	MaxConcurrentTasks int32             `json:"max_concurrent_tasks"`
 	OwnerID            *string           `json:"owner_id"`
 	Skills             []SkillResponse   `json:"skills"`
+	Runtimes           []AgentRuntimeRef `json:"runtimes"`
 	CreatedAt          string            `json:"created_at"`
 	UpdatedAt          string            `json:"updated_at"`
 	ArchivedAt         *string           `json:"archived_at"`
@@ -72,7 +84,6 @@ func agentToResponse(a db.Agent) AgentResponse {
 	return AgentResponse{
 		ID:                 uuidToString(a.ID),
 		WorkspaceID:        uuidToString(a.WorkspaceID),
-		RuntimeID:          uuidToString(a.RuntimeID),
 		Name:               a.Name,
 		Description:        a.Description,
 		Instructions:       a.Instructions,
@@ -86,11 +97,53 @@ func agentToResponse(a db.Agent) AgentResponse {
 		MaxConcurrentTasks: a.MaxConcurrentTasks,
 		OwnerID:            uuidToPtr(a.OwnerID),
 		Skills:             []SkillResponse{},
+		Runtimes:           []AgentRuntimeRef{},
 		CreatedAt:          timestampToString(a.CreatedAt),
 		UpdatedAt:          timestampToString(a.UpdatedAt),
 		ArchivedAt:         timestampToPtr(a.ArchivedAt),
 		ArchivedBy:         uuidToPtr(a.ArchivedBy),
 	}
+}
+
+// buildAgentResponse enriches an AgentResponse with skills and runtime
+// assignments. Call sites that used to call agentToResponse + inline skill
+// loading should call this instead.
+//
+// NOTE: This performs N+1 queries when called from ListAgents (one per agent).
+// Acceptable at current team sizes; a batch path can be added later if needed.
+func (h *Handler) buildAgentResponse(ctx context.Context, a db.Agent) (AgentResponse, error) {
+	resp := agentToResponse(a)
+
+	skills, err := h.Queries.ListAgentSkills(ctx, a.ID)
+	if err != nil {
+		return resp, fmt.Errorf("list skills: %w", err)
+	}
+	if len(skills) > 0 {
+		resp.Skills = make([]SkillResponse, len(skills))
+		for i, s := range skills {
+			resp.Skills[i] = skillToResponse(s)
+		}
+	}
+
+	assignments, err := h.Queries.ListAgentRuntimeAssignments(ctx, a.ID)
+	if err != nil {
+		return resp, fmt.Errorf("list assignments: %w", err)
+	}
+	resp.Runtimes = make([]AgentRuntimeRef, len(assignments))
+	for i, asn := range assignments {
+		resp.Runtimes[i] = AgentRuntimeRef{
+			ID:          uuidToString(asn.RuntimeID),
+			Name:        asn.RuntimeName,
+			Status:      asn.RuntimeStatus,
+			RuntimeMode: asn.RuntimeMode,
+			Provider:    asn.RuntimeProvider,
+			DeviceInfo:  asn.RuntimeDeviceInfo,
+			OwnerID:     uuidToPtr(asn.RuntimeOwnerID),
+			LastUsedAt:  timestampToPtr(asn.LastUsedAt),
+		}
+	}
+
+	return resp, nil
 }
 
 // RepoData holds repository information included in claim responses so the
@@ -101,27 +154,27 @@ type RepoData struct {
 }
 
 type AgentTaskResponse struct {
-	ID             string         `json:"id"`
-	AgentID        string         `json:"agent_id"`
-	RuntimeID      string         `json:"runtime_id"`
-	IssueID        string         `json:"issue_id"`
-	WorkspaceID    string         `json:"workspace_id"`
-	Status         string         `json:"status"`
-	Priority       int32          `json:"priority"`
-	DispatchedAt   *string        `json:"dispatched_at"`
-	StartedAt      *string        `json:"started_at"`
-	CompletedAt    *string        `json:"completed_at"`
-	Result         any            `json:"result"`
-	Error          *string        `json:"error"`
-	Agent          *TaskAgentData `json:"agent,omitempty"`
-	Repos          []RepoData     `json:"repos,omitempty"`
-	CreatedAt      string         `json:"created_at"`
-	PriorSessionID   string         `json:"prior_session_id,omitempty"`    // session ID from a previous task on same issue
-	PriorWorkDir     string         `json:"prior_work_dir,omitempty"`     // work_dir from a previous task on same issue
-	TriggerCommentID      *string        `json:"trigger_comment_id,omitempty"`      // comment that triggered this task
-	TriggerCommentContent string         `json:"trigger_comment_content,omitempty"` // content of the triggering comment
-	ChatSessionID         string         `json:"chat_session_id,omitempty"`         // non-empty for chat tasks
-	ChatMessage           string         `json:"chat_message,omitempty"`            // user message for chat tasks
+	ID                    string         `json:"id"`
+	AgentID               string         `json:"agent_id"`
+	RuntimeID             string         `json:"runtime_id"`
+	IssueID               string         `json:"issue_id"`
+	WorkspaceID           string         `json:"workspace_id"`
+	Status                string         `json:"status"`
+	Priority              int32          `json:"priority"`
+	DispatchedAt          *string        `json:"dispatched_at"`
+	StartedAt             *string        `json:"started_at"`
+	CompletedAt           *string        `json:"completed_at"`
+	Result                any            `json:"result"`
+	Error                 *string        `json:"error"`
+	Agent                 *TaskAgentData `json:"agent,omitempty"`
+	Repos                 []RepoData     `json:"repos,omitempty"`
+	CreatedAt             string         `json:"created_at"`
+	PriorSessionID        string         `json:"prior_session_id,omitempty"`
+	PriorWorkDir          string         `json:"prior_work_dir,omitempty"`
+	TriggerCommentID      *string        `json:"trigger_comment_id,omitempty"`
+	TriggerCommentContent string         `json:"trigger_comment_content,omitempty"`
+	ChatSessionID         string         `json:"chat_session_id,omitempty"`
+	ChatMessage           string         `json:"chat_message,omitempty"`
 }
 
 // TaskAgentData holds agent info included in claim responses so the daemon
@@ -141,16 +194,16 @@ func taskToResponse(t db.AgentTaskQueue) AgentTaskResponse {
 		json.Unmarshal(t.Result, &result)
 	}
 	return AgentTaskResponse{
-		ID:           uuidToString(t.ID),
-		AgentID:      uuidToString(t.AgentID),
-		RuntimeID:    uuidToString(t.RuntimeID),
-		IssueID:      uuidToString(t.IssueID),
-		Status:       t.Status,
-		Priority:     t.Priority,
-		DispatchedAt: timestampToPtr(t.DispatchedAt),
-		StartedAt:    timestampToPtr(t.StartedAt),
-		CompletedAt:  timestampToPtr(t.CompletedAt),
-		Result:       result,
+		ID:               uuidToString(t.ID),
+		AgentID:          uuidToString(t.AgentID),
+		RuntimeID:        uuidToString(t.RuntimeID),
+		IssueID:          uuidToString(t.IssueID),
+		Status:           t.Status,
+		Priority:         t.Priority,
+		DispatchedAt:     timestampToPtr(t.DispatchedAt),
+		StartedAt:        timestampToPtr(t.StartedAt),
+		CompletedAt:      timestampToPtr(t.CompletedAt),
+		Result:           result,
 		Error:            textToPtr(t.Error),
 		CreatedAt:        timestampToString(t.CreatedAt),
 		TriggerCommentID: uuidToPtr(t.TriggerCommentID),
@@ -177,28 +230,15 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Batch-load skills for all agents to avoid N+1.
-	skillRows, err := h.Queries.ListAgentSkillsByWorkspace(r.Context(), parseUUID(workspaceID))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load agent skills")
-		return
-	}
-	skillMap := map[string][]SkillResponse{}
-	for _, row := range skillRows {
-		agentID := uuidToString(row.AgentID)
-		skillMap[agentID] = append(skillMap[agentID], SkillResponse{
-			ID:          uuidToString(row.ID),
-			Name:        row.Name,
-			Description: row.Description,
-		})
-	}
-
 	// All agents (including private) are visible to workspace members.
+	// NOTE: buildAgentResponse does N+1 queries (skills + assignments per agent).
+	// Acceptable for current team sizes; optimize with batch queries later if needed.
 	visible := make([]AgentResponse, 0, len(agents))
 	for _, a := range agents {
-		resp := agentToResponse(a)
-		if skills, ok := skillMap[resp.ID]; ok {
-			resp.Skills = skills
+		resp, err := h.buildAgentResponse(r.Context(), a)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to build agent response")
+			return
 		}
 		// Redact custom_env for users who are not the agent owner or workspace owner/admin.
 		if !canViewAgentEnv(a, userID, member.Role) {
@@ -216,17 +256,10 @@ func (h *Handler) GetAgent(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	resp := agentToResponse(agent)
-	skills, err := h.Queries.ListAgentSkills(r.Context(), agent.ID)
+	resp, err := h.buildAgentResponse(r.Context(), agent)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to load agent skills")
+		writeError(w, http.StatusInternalServerError, "failed to build response")
 		return
-	}
-	if len(skills) > 0 {
-		resp.Skills = make([]SkillResponse, len(skills))
-		for i, s := range skills {
-			resp.Skills[i] = skillToResponse(s)
-		}
 	}
 
 	// Redact custom_env for users who are not the agent owner or workspace owner/admin.
@@ -245,7 +278,7 @@ type CreateAgentRequest struct {
 	Description        string            `json:"description"`
 	Instructions       string            `json:"instructions"`
 	AvatarURL          *string           `json:"avatar_url"`
-	RuntimeID          string            `json:"runtime_id"`
+	RuntimeIDs         []string          `json:"runtime_ids"`
 	RuntimeConfig      any               `json:"runtime_config"`
 	CustomEnv          map[string]string `json:"custom_env"`
 	CustomArgs         []string          `json:"custom_args"`
@@ -271,8 +304,8 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if req.RuntimeID == "" {
-		writeError(w, http.StatusBadRequest, "runtime_id is required")
+	if len(req.RuntimeIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "runtime_ids must contain at least one runtime")
 		return
 	}
 	if req.Visibility == "" {
@@ -282,13 +315,23 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		req.MaxConcurrentTasks = 6
 	}
 
-	runtime, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
-		ID:          parseUUID(req.RuntimeID),
-		WorkspaceID: parseUUID(workspaceID),
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid runtime_id")
-		return
+	// Validate all runtimes belong to this workspace; capture the first for the
+	// legacy runtime_mode column.
+	runtimeUUIDs := make([]pgtype.UUID, 0, len(req.RuntimeIDs))
+	var primaryMode string
+	for i, rid := range req.RuntimeIDs {
+		rt, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
+			ID:          parseUUID(rid),
+			WorkspaceID: parseUUID(workspaceID),
+		})
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid runtime_id: %s", rid))
+			return
+		}
+		runtimeUUIDs = append(runtimeUUIDs, rt.ID)
+		if i == 0 {
+			primaryMode = rt.RuntimeMode
+		}
 	}
 
 	rc, _ := json.Marshal(req.RuntimeConfig)
@@ -306,15 +349,24 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		ca = []byte("[]")
 	}
 
-	agent, err := h.Queries.CreateAgent(r.Context(), db.CreateAgentParams{
+	// Create agent + assignments in a single transaction.
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start transaction")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	qtx := h.Queries.WithTx(tx)
+
+	agent, err := qtx.CreateAgent(r.Context(), db.CreateAgentParams{
 		WorkspaceID:        parseUUID(workspaceID),
 		Name:               req.Name,
 		Description:        req.Description,
 		Instructions:       req.Instructions,
 		AvatarUrl:          ptrToText(req.AvatarURL),
-		RuntimeMode:        runtime.RuntimeMode,
+		RuntimeMode:        primaryMode,
 		RuntimeConfig:      rc,
-		RuntimeID:          runtime.ID,
 		Visibility:         req.Visibility,
 		MaxConcurrentTasks: req.MaxConcurrentTasks,
 		OwnerID:            parseUUID(ownerID),
@@ -322,8 +374,6 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		CustomArgs:         ca,
 	})
 	if err != nil {
-		// Unique constraint on (workspace_id, name) — return a clear conflict error
-		// so the UI can show the right message instead of a generic 500.
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "agent_workspace_name_unique" {
 			writeError(w, http.StatusConflict, fmt.Sprintf("an agent named %q already exists in this workspace", req.Name))
@@ -333,33 +383,53 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create agent: "+err.Error())
 		return
 	}
-	slog.Info("agent created", append(logger.RequestAttrs(r), "agent_id", uuidToString(agent.ID), "name", agent.Name, "workspace_id", workspaceID)...)
 
-	if runtime.Status == "online" {
-		h.TaskService.ReconcileAgentStatus(r.Context(), agent.ID)
-		agent, _ = h.Queries.GetAgent(r.Context(), agent.ID)
+	for _, rtID := range runtimeUUIDs {
+		if err := qtx.AddAgentRuntimeAssignment(r.Context(), db.AddAgentRuntimeAssignmentParams{
+			AgentID:   agent.ID,
+			RuntimeID: rtID,
+		}); err != nil {
+			slog.Warn("add agent runtime assignment failed", append(logger.RequestAttrs(r), "error", err, "agent_id", uuidToString(agent.ID))...)
+			writeError(w, http.StatusInternalServerError, "failed to assign runtime")
+			return
+		}
 	}
 
-	resp := agentToResponse(agent)
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit transaction")
+		return
+	}
+
+	slog.Info("agent created", append(logger.RequestAttrs(r), "agent_id", uuidToString(agent.ID), "name", agent.Name, "workspace_id", workspaceID)...)
+
+	// Reload agent after reconcile so status is up to date.
+	h.TaskService.ReconcileAgentStatus(r.Context(), agent.ID)
+	if reloaded, err := h.Queries.GetAgent(r.Context(), agent.ID); err == nil {
+		agent = reloaded
+	}
+
+	resp, err := h.buildAgentResponse(r.Context(), agent)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to build response")
+		return
+	}
 	actorType, actorID := h.resolveActor(r, ownerID, workspaceID)
 	h.publish(protocol.EventAgentCreated, workspaceID, actorType, actorID, map[string]any{"agent": resp})
 	writeJSON(w, http.StatusCreated, resp)
 }
 
-
-
 type UpdateAgentRequest struct {
-	Name               *string            `json:"name"`
-	Description        *string            `json:"description"`
-	Instructions       *string            `json:"instructions"`
-	AvatarURL          *string            `json:"avatar_url"`
-	RuntimeID          *string            `json:"runtime_id"`
-	RuntimeConfig      any                `json:"runtime_config"`
+	Name               *string    `json:"name"`
+	Description        *string    `json:"description"`
+	Instructions       *string    `json:"instructions"`
+	AvatarURL          *string    `json:"avatar_url"`
+	RuntimeIDs         *[]string  `json:"runtime_ids"`
+	RuntimeConfig      any        `json:"runtime_config"`
 	CustomEnv          *map[string]string `json:"custom_env"`
-	CustomArgs         *[]string          `json:"custom_args"`
-	Visibility         *string            `json:"visibility"`
-	Status             *string            `json:"status"`
-	MaxConcurrentTasks *int32             `json:"max_concurrent_tasks"`
+	CustomArgs         *[]string  `json:"custom_args"`
+	Visibility         *string    `json:"visibility"`
+	Status             *string    `json:"status"`
+	MaxConcurrentTasks *int32     `json:"max_concurrent_tasks"`
 }
 
 // canViewAgentEnv checks whether the requesting user is allowed to see the
@@ -418,6 +488,27 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate runtime_ids if provided.
+	var runtimeUUIDs []pgtype.UUID
+	if req.RuntimeIDs != nil {
+		if len(*req.RuntimeIDs) == 0 {
+			writeError(w, http.StatusBadRequest, "runtime_ids must contain at least one runtime")
+			return
+		}
+		runtimeUUIDs = make([]pgtype.UUID, 0, len(*req.RuntimeIDs))
+		for _, rid := range *req.RuntimeIDs {
+			rt, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
+				ID:          parseUUID(rid),
+				WorkspaceID: agent.WorkspaceID,
+			})
+			if err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid runtime_id: %s", rid))
+				return
+			}
+			runtimeUUIDs = append(runtimeUUIDs, rt.ID)
+		}
+	}
+
 	params := db.UpdateAgentParams{
 		ID: parseUUID(id),
 	}
@@ -445,17 +536,15 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		ca, _ := json.Marshal(*req.CustomArgs)
 		params.CustomArgs = ca
 	}
-	if req.RuntimeID != nil {
-		runtime, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
-			ID:          parseUUID(*req.RuntimeID),
+	if req.RuntimeIDs != nil && len(runtimeUUIDs) > 0 {
+		// Update the legacy runtime_mode column from the first runtime.
+		rt, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
+			ID:          runtimeUUIDs[0],
 			WorkspaceID: agent.WorkspaceID,
 		})
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid runtime_id")
-			return
+		if err == nil {
+			params.RuntimeMode = pgtype.Text{String: rt.RuntimeMode, Valid: true}
 		}
-		params.RuntimeID = runtime.ID
-		params.RuntimeMode = pgtype.Text{String: runtime.RuntimeMode, Valid: true}
 	}
 	if req.Visibility != nil {
 		params.Visibility = pgtype.Text{String: *req.Visibility, Valid: true}
@@ -467,14 +556,56 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		params.MaxConcurrentTasks = pgtype.Int4{Int32: *req.MaxConcurrentTasks, Valid: true}
 	}
 
-	agent, err := h.Queries.UpdateAgent(r.Context(), params)
+	// Run agent update + runtime assignment replacement in a single transaction.
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start transaction")
+		return
+	}
+	defer tx.Rollback(r.Context())
+
+	qtx := h.Queries.WithTx(tx)
+
+	agent, err = qtx.UpdateAgent(r.Context(), params)
 	if err != nil {
 		slog.Warn("update agent failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 		writeError(w, http.StatusInternalServerError, "failed to update agent: "+err.Error())
 		return
 	}
 
-	resp := agentToResponse(agent)
+	if len(runtimeUUIDs) > 0 {
+		// Add new assignments first (ON CONFLICT DO NOTHING preserves created_at
+		// for surviving rows), then prune assignments not in the new set.
+		for _, rtID := range runtimeUUIDs {
+			if err := qtx.AddAgentRuntimeAssignment(r.Context(), db.AddAgentRuntimeAssignmentParams{
+				AgentID:   agent.ID,
+				RuntimeID: rtID,
+			}); err != nil {
+				slog.Warn("add agent runtime assignment failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+				writeError(w, http.StatusInternalServerError, "failed to assign runtime")
+				return
+			}
+		}
+		if err := qtx.RemoveAgentRuntimeAssignmentsNotIn(r.Context(), db.RemoveAgentRuntimeAssignmentsNotInParams{
+			AgentID:    agent.ID,
+			RuntimeIds: runtimeUUIDs,
+		}); err != nil {
+			slog.Warn("prune agent runtime assignments failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+			writeError(w, http.StatusInternalServerError, "failed to prune runtime assignments")
+			return
+		}
+	}
+
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit transaction")
+		return
+	}
+
+	resp, err := h.buildAgentResponse(r.Context(), agent)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to build response")
+		return
+	}
 	slog.Info("agent updated", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", uuidToString(agent.WorkspaceID))...)
 	userID := requestUserID(r)
 	actorType, actorID := h.resolveActor(r, userID, uuidToString(agent.WorkspaceID))
@@ -514,7 +645,11 @@ func (h *Handler) ArchiveAgent(w http.ResponseWriter, r *http.Request) {
 
 	wsID := uuidToString(archived.WorkspaceID)
 	slog.Info("agent archived", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", wsID)...)
-	resp := agentToResponse(archived)
+	resp, err := h.buildAgentResponse(r.Context(), archived)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to build response")
+		return
+	}
 	actorType, actorID := h.resolveActor(r, userID, wsID)
 	h.publish(protocol.EventAgentArchived, wsID, actorType, actorID, map[string]any{"agent": resp})
 	writeJSON(w, http.StatusOK, resp)
@@ -543,7 +678,11 @@ func (h *Handler) RestoreAgent(w http.ResponseWriter, r *http.Request) {
 
 	wsID := uuidToString(restored.WorkspaceID)
 	slog.Info("agent restored", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", wsID)...)
-	resp := agentToResponse(restored)
+	resp, err := h.buildAgentResponse(r.Context(), restored)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to build response")
+		return
+	}
 	userID := requestUserID(r)
 	actorType, actorID := h.resolveActor(r, userID, wsID)
 	h.publish(protocol.EventAgentRestored, wsID, actorType, actorID, map[string]any{"agent": resp})
