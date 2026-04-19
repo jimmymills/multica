@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 import { CreateAgentDialog } from "./create-agent-dialog";
-import type { RuntimeDevice, MemberWithUser } from "@multica/core/types";
+import type { RuntimeDevice, MemberWithUser, RuntimeGroup } from "@multica/core/types";
 
 const runtime = (overrides: Partial<RuntimeDevice> = {}): RuntimeDevice => ({
   id: "rt-1",
@@ -27,6 +27,7 @@ describe("CreateAgentDialog", () => {
     render(
       <CreateAgentDialog
         runtimes={[runtime({ id: "rt-1", name: "Workstation" }), runtime({ id: "rt-2", name: "Laptop" })]}
+        groups={[]}
         members={members}
         currentUserId="user-1"
         onClose={vi.fn()}
@@ -45,6 +46,7 @@ describe("CreateAgentDialog", () => {
           runtime({ id: "rt-1", name: "Workstation" }),
           runtime({ id: "rt-2", name: "Laptop" }),
         ]}
+        groups={[]}
         members={members}
         currentUserId="user-1"
         onClose={vi.fn()}
@@ -67,6 +69,7 @@ describe("CreateAgentDialog", () => {
     render(
       <CreateAgentDialog
         runtimes={[runtime({ id: "rt-1", name: "Workstation" })]}
+        groups={[]}
         members={members}
         currentUserId="user-1"
         onClose={vi.fn()}
@@ -83,6 +86,7 @@ describe("CreateAgentDialog", () => {
     render(
       <CreateAgentDialog
         runtimes={[]}
+        groups={[]}
         members={members}
         currentUserId="user-1"
         onClose={vi.fn()}
@@ -91,5 +95,44 @@ describe("CreateAgentDialog", () => {
     );
     expect(screen.getByText(/register a runtime/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^create$/i })).toBeDisabled();
+  });
+
+  it("submits group_ids when a group is selected", async () => {
+    const onCreate = vi.fn().mockResolvedValue(undefined);
+    const g: RuntimeGroup = { id: "g1", workspace_id: "ws", name: "Team", description: "", runtimes: [], active_override: null, member_agent_count: 0, created_by: null, created_at: "", updated_at: "" };
+    render(
+      <CreateAgentDialog
+        runtimes={[runtime({ id: "rt-1", name: "Workstation" })]}
+        groups={[g]}
+        members={[]}
+        currentUserId="u1"
+        onClose={vi.fn()}
+        onCreate={onCreate}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText(/deep research/i), { target: { value: "A" } });
+    fireEvent.click(screen.getByRole("button", { name: /add group/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Team/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+    await waitFor(() => expect(onCreate).toHaveBeenCalled());
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ group_ids: ["g1"] }));
+  });
+
+  it("enables Create when only a group is selected", () => {
+    const g: RuntimeGroup = { id: "g1", workspace_id: "ws", name: "Team", description: "", runtimes: [], active_override: null, member_agent_count: 0, created_by: null, created_at: "", updated_at: "" };
+    render(
+      <CreateAgentDialog
+        runtimes={[]}
+        groups={[g]}
+        members={[]}
+        currentUserId="u1"
+        onClose={vi.fn()}
+        onCreate={vi.fn()}
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText(/deep research/i), { target: { value: "A" } });
+    fireEvent.click(screen.getByRole("button", { name: /add group/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Team/i }));
+    expect(screen.getByRole("button", { name: /^create$/i })).not.toBeDisabled();
   });
 });

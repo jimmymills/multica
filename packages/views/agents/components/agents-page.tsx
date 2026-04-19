@@ -33,6 +33,10 @@ export function AgentsPage() {
   const [showCreate, setShowCreate] = useState(false);
   const { data: runtimes = [], isLoading: runtimesLoading } = useQuery(runtimeListOptions(wsId));
   const { data: members = [] } = useQuery(memberListOptions(wsId));
+  const { data: groups = [] } = useQuery({
+    queryKey: ["runtime-groups", wsId],
+    queryFn: () => api.listRuntimeGroups(wsId),
+  });
   const { defaultLayout, onLayoutChanged } = useDefaultLayout({
     id: "multica_agents_layout",
   });
@@ -203,6 +207,7 @@ export function AgentsPage() {
             key={selected.id}
             agent={selected}
             runtimes={runtimes}
+            groups={groups}
             members={members}
             currentUserId={currentUser?.id ?? null}
             onUpdate={handleUpdate}
@@ -229,6 +234,7 @@ export function AgentsPage() {
         <CreateAgentDialog
           runtimes={runtimes}
           runtimesLoading={runtimesLoading}
+          groups={groups}
           members={members}
           currentUserId={currentUser?.id ?? null}
           onClose={() => setShowCreate(false)}
