@@ -10,6 +10,7 @@ const runtime = (id: string, name: string): RuntimeDevice => ({
   name,
   runtime_mode: "local",
   provider: "claude",
+  launch_header: "",
   status: "online",
   device_info: "",
   metadata: {},

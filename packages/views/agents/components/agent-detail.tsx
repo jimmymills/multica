@@ -93,6 +93,9 @@ export function AgentDetail({
 
   const assignedRuntimes = getAssignedRuntimes(agent, runtimes);
   const hasCloudRuntime = assignedRuntimes.some((r) => r.runtime_mode === "cloud");
+  const runtimeDevice =
+    assignedRuntimes.find((r) => r.runtime_mode === agent.runtime_mode) ??
+    assignedRuntimes[0];
   const runtimeBadge =
     effectiveRuntimeIds.size === 1
       ? (assignedRuntimes[0]?.name ?? "1 runtime")
@@ -215,6 +218,7 @@ export function AgentDetail({
         {activeTab === "custom_args" && (
           <CustomArgsTab
             agent={agent}
+            runtimeDevice={runtimeDevice}
             onSave={(updates) => onUpdate(agent.id, updates)}
           />
         )}
