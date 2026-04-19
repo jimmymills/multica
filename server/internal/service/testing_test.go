@@ -15,6 +15,15 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// newUUID returns a fresh random pgtype.UUID.
+func newUUID() pgtype.UUID {
+	var id pgtype.UUID
+	if err := id.Scan(uuid.NewString()); err != nil {
+		panic(err)
+	}
+	return id
+}
+
 var (
 	testPool        *pgxpool.Pool
 	testWorkspaceID pgtype.UUID
@@ -158,6 +167,24 @@ func setupTaskServiceTest(t *testing.T) (*TaskService, testContext) {
 		testPool.Exec(bgCtx, `
 			DELETE FROM issue WHERE workspace_id = $1 AND title LIKE 'test-issue-%'
 		`, testWorkspaceID)
+		// Runtime group tables — must run before agent_runtime to satisfy FKs.
+		testPool.Exec(bgCtx, `
+			DELETE FROM runtime_group_override
+			WHERE group_id IN (SELECT id FROM runtime_group WHERE workspace_id = $1)
+		`, testWorkspaceID)
+		testPool.Exec(bgCtx, `
+			DELETE FROM runtime_group_member
+			WHERE group_id IN (SELECT id FROM runtime_group WHERE workspace_id = $1)
+		`, testWorkspaceID)
+		testPool.Exec(bgCtx, `
+			DELETE FROM agent_runtime_group
+			WHERE agent_id IN (
+				SELECT id FROM agent WHERE workspace_id = $1 AND name LIKE 'test-agent-%'
+			)
+		`, testWorkspaceID)
+		testPool.Exec(bgCtx, `
+			DELETE FROM runtime_group WHERE workspace_id = $1
+		`, testWorkspaceID)
 		testPool.Exec(bgCtx, `
 			DELETE FROM agent_runtime WHERE workspace_id = $1 AND name LIKE 'test-rt-%'
 		`, testWorkspaceID)
@@ -275,4 +302,38 @@ func (tc *testContext) seedUsage(t *testing.T, runtimeID pgtype.UUID, tokens int
 	`, taskID, tokens, at); err != nil {
 		t.Fatalf("seedUsage: %v", err)
 	}
+}
+
+// createRuntimeInOtherWorkspace creates a separate workspace + runtime and
+// returns the runtime UUID. Used to test cross-workspace rejection.
+func (tc *testContext) createRuntimeInOtherWorkspace(t *testing.T) pgtype.UUID {
+	t.Helper()
+	wsID := newUUID()
+	_, err := testPool.Exec(tc.ctx,
+		`INSERT INTO workspace (id, name, slug, description, issue_prefix)
+		 VALUES ($1, $2, $3, '', 'TST')`,
+		wsID,
+		"service-test-other-"+uuid.NewString(),
+		"svc-test-other-"+uuid.NewString(),
+	)
+	if err != nil {
+		t.Fatalf("createRuntimeInOtherWorkspace: insert workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, wsID)
+	})
+
+	rtID := newUUID()
+	_, err = testPool.Exec(tc.ctx,
+		`INSERT INTO agent_runtime (id, workspace_id, name, runtime_mode, provider,
+		 status, device_info, metadata, last_seen_at)
+		 VALUES ($1, $2, $3, 'local', 'claude', 'online', '', '{}'::jsonb, now())`,
+		rtID,
+		wsID,
+		"test-rt-other-"+uuid.NewString(),
+	)
+	if err != nil {
+		t.Fatalf("createRuntimeInOtherWorkspace: insert runtime: %v", err)
+	}
+	return rtID
 }
