@@ -30,6 +30,11 @@ interface TestAgent {
   name: string;
 }
 
+interface TestRuntimeGroup {
+  id: string;
+  name: string;
+}
+
 interface TestTask {
   id: string;
   runtime_id: string;
@@ -44,6 +49,7 @@ export class TestApiClient {
   private createdIssueIds: string[] = [];
   private createdAgentIds: string[] = [];
   private createdRuntimeIds: string[] = [];
+  private createdRuntimeGroupIds: string[] = [];
 
   async login(email: string, name: string) {
     const client = new pg.Client(DATABASE_URL);
@@ -173,16 +179,17 @@ export class TestApiClient {
   }
 
   /**
-   * Create an agent via the REST API with one or more runtime assignments.
+   * Create an agent via the REST API with one or more runtime/group assignments.
    * Tracks the created agent for cleanup.
    */
-  async createAgent(opts: { name?: string; runtime_ids: string[] }): Promise<TestAgent> {
+  async createAgent(opts: { name?: string; runtime_ids?: string[]; group_ids?: string[] }): Promise<TestAgent> {
     const name = opts.name ?? `E2E Agent ${Date.now()}`;
     const res = await this.authedFetch("/api/agents", {
       method: "POST",
       body: JSON.stringify({
         name,
-        runtime_ids: opts.runtime_ids,
+        runtime_ids: opts.runtime_ids ?? [],
+        group_ids: opts.group_ids ?? [],
         visibility: "private",
         max_concurrent_tasks: 6,
       }),
@@ -194,6 +201,54 @@ export class TestApiClient {
     const agent = (await res.json()) as TestAgent;
     this.createdAgentIds.push(agent.id);
     return agent;
+  }
+
+  /**
+   * Create a runtime group via the REST API.
+   * Tracks the created group for cleanup.
+   */
+  async createRuntimeGroup(opts: { name: string; runtime_ids: string[] }): Promise<TestRuntimeGroup> {
+    const res = await this.authedFetch("/api/runtime-groups", {
+      method: "POST",
+      body: JSON.stringify(opts),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`createRuntimeGroup failed: ${res.status} ${body}`);
+    }
+    const group = (await res.json()) as TestRuntimeGroup;
+    this.createdRuntimeGroupIds.push(group.id);
+    return group;
+  }
+
+  /**
+   * Set a priority override on a runtime group so all tasks route to a single runtime.
+   */
+  async setRuntimeGroupOverride(groupId: string, runtimeId: string, endsAt: Date): Promise<void> {
+    const res = await this.authedFetch(`/api/runtime-groups/${groupId}/override`, {
+      method: "PUT",
+      body: JSON.stringify({
+        runtime_id: runtimeId,
+        ends_at: endsAt.toISOString(),
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`setRuntimeGroupOverride failed: ${res.status} ${body}`);
+    }
+  }
+
+  /**
+   * Clear the priority override on a runtime group, resuming normal distribution.
+   */
+  async clearRuntimeGroupOverride(groupId: string): Promise<void> {
+    const res = await this.authedFetch(`/api/runtime-groups/${groupId}/override`, {
+      method: "DELETE",
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`clearRuntimeGroupOverride failed: ${res.status} ${body}`);
+    }
   }
 
   /**
@@ -244,10 +299,17 @@ export class TestApiClient {
     }
     this.createdAgentIds = [];
 
-    if (this.createdRuntimeIds.length > 0) {
+    if (this.createdRuntimeIds.length > 0 || this.createdRuntimeGroupIds.length > 0) {
       const client = new pg.Client(DATABASE_URL);
       await client.connect();
       try {
+        for (const id of this.createdRuntimeGroupIds) {
+          try {
+            await client.query("DELETE FROM runtime_group WHERE id = $1", [id]);
+          } catch {
+            /* ignore */
+          }
+        }
         for (const id of this.createdRuntimeIds) {
           try {
             await client.query("DELETE FROM agent_runtime WHERE id = $1", [id]);
@@ -259,6 +321,7 @@ export class TestApiClient {
         await client.end();
       }
       this.createdRuntimeIds = [];
+      this.createdRuntimeGroupIds = [];
     }
   }
 

@@ -10,7 +10,7 @@ import {
   Plus,
   X,
 } from "lucide-react";
-import type { Agent, AgentVisibility, RuntimeDevice, MemberWithUser } from "@multica/core/types";
+import type { Agent, AgentVisibility, RuntimeDevice, MemberWithUser, RuntimeGroup } from "@multica/core/types";
 import {
   Popover,
   PopoverTrigger,
@@ -28,16 +28,18 @@ import { ProviderLogo } from "../../../runtimes/components/provider-logo";
 export function SettingsTab({
   agent,
   runtimes,
+  groups,
   members,
   currentUserId: _currentUserId,  // kept for API compatibility; may be used for mine/all filtering in future
   onSave,
 }: {
   agent: Agent;
   runtimes: RuntimeDevice[];
+  groups: RuntimeGroup[];
   members: MemberWithUser[];
   /** The current user's id — available for runtime ownership filtering */
   currentUserId: string | null;
-  onSave: (updates: Partial<Agent>) => Promise<void>;
+  onSave: (updates: Partial<Agent> & { group_ids?: string[] }) => Promise<void>;
 }) {
   const [name, setName] = useState(agent.name);
   const [description, setDescription] = useState(agent.description ?? "");
@@ -47,6 +49,12 @@ export function SettingsTab({
     () => agent.runtime_ids.filter((id) => runtimes.some((r) => r.id === id)),
   );
   const [addRuntimeOpen, setAddRuntimeOpen] = useState(false);
+  const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>(
+    () => agent.groups
+      .filter((g) => groups.some((wg) => wg.id === g.id))
+      .map((g) => g.id),
+  );
+  const [addGroupOpen, setAddGroupOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const { upload, uploading } = useFileUpload(api);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -55,6 +63,15 @@ export function SettingsTab({
     if (!ownerId) return null;
     return members.find((m) => m.user_id === ownerId) ?? null;
   };
+
+  const selectedGroups = useMemo(
+    () => selectedGroupIds.map((id) => groups.find((g) => g.id === id)).filter(Boolean) as RuntimeGroup[],
+    [selectedGroupIds, groups],
+  );
+  const candidateGroups = useMemo(
+    () => groups.filter((g) => !selectedGroupIds.includes(g.id)),
+    [groups, selectedGroupIds],
+  );
 
   // Runtimes not yet assigned — shown in the Add picker
   const unassignedRuntimes = useMemo(
@@ -89,14 +106,19 @@ export function SettingsTab({
     selectedRuntimeIds.length !== agent.runtime_ids.length ||
     selectedRuntimeIds.some((id) => !agent.runtime_ids.includes(id));
 
+  const groupsDirty =
+    selectedGroupIds.length !== agent.groups.length ||
+    selectedGroupIds.some((id, i) => id !== agent.groups[i]?.id);
+
   const dirty =
     name !== agent.name ||
     description !== (agent.description ?? "") ||
     visibility !== agent.visibility ||
     maxTasks !== agent.max_concurrent_tasks ||
-    runtimesChanged;
+    runtimesChanged ||
+    groupsDirty;
 
-  const noRuntimes = selectedRuntimeIds.length === 0;
+  const noRuntimes = selectedRuntimeIds.length + selectedGroupIds.length === 0;
 
   const handleSave = async () => {
     if (!name.trim()) {
@@ -104,7 +126,7 @@ export function SettingsTab({
       return;
     }
     if (noRuntimes) {
-      toast.error("At least one runtime is required");
+      toast.error("At least one runtime or group is required");
       return;
     }
 
@@ -116,6 +138,7 @@ export function SettingsTab({
         visibility,
         max_concurrent_tasks: maxTasks,
         runtime_ids: selectedRuntimeIds,
+        group_ids: selectedGroupIds,
       });
       toast.success("Settings saved");
     } catch {
@@ -226,6 +249,54 @@ export function SettingsTab({
       </div>
 
       <div>
+        <Label className="text-xs text-muted-foreground">Groups</Label>
+        <div className="mt-1.5 flex flex-wrap gap-2">
+          {selectedGroups.map((g) => (
+            <div key={g.id} className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
+              <span className="truncate font-medium">{g.name}</span>
+              {g.active_override && (
+                <span
+                  className="shrink-0 rounded bg-amber-500/10 px-1.5 py-0.5 text-xs font-medium text-amber-600"
+                  title={`Overridden to ${g.active_override.runtime_name} until ${new Date(g.active_override.ends_at).toLocaleString()}`}
+                >
+                  Override
+                </span>
+              )}
+              <button
+                type="button"
+                aria-label={`Remove ${g.name}`}
+                onClick={() => setSelectedGroupIds((ids) => ids.filter((id) => id !== g.id))}
+                className="ml-1 text-muted-foreground hover:text-foreground"
+              >×</button>
+            </div>
+          ))}
+          <Popover open={addGroupOpen} onOpenChange={setAddGroupOpen}>
+            <PopoverTrigger
+              disabled={candidateGroups.length === 0}
+              className="rounded-lg border border-dashed border-border bg-background px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+            >+ Add group</PopoverTrigger>
+            <PopoverContent align="start" className="w-72 p-1 max-h-60 overflow-y-auto">
+              {candidateGroups.map((g) => (
+                <button
+                  key={g.id}
+                  role="menuitem"
+                  onClick={() => { setSelectedGroupIds((ids) => [...ids, g.id]); setAddGroupOpen(false); }}
+                  className="flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm hover:bg-accent/50"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium">{g.name}</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      {g.runtimes.length} runtime{g.runtimes.length === 1 ? "" : "s"}
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </PopoverContent>
+          </Popover>
+        </div>
+      </div>
+
+      <div>
         <Label className="text-xs text-muted-foreground">Runtimes</Label>
         <div className="mt-1.5 flex flex-wrap gap-2">
           {assignedDevices.map((device) => {
@@ -323,7 +394,7 @@ export function SettingsTab({
         </div>
 
         {noRuntimes && (
-          <p className="mt-1.5 text-xs text-destructive">At least one runtime is required.</p>
+          <p className="mt-1.5 text-xs text-destructive">At least one runtime or group is required.</p>
         )}
       </div>
 

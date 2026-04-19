@@ -188,6 +188,109 @@ func TestEnqueueTaskForIssue_DistributesAcrossRuntimes(t *testing.T) {
 	}
 }
 
+func TestCreateAgent_RejectsNoRuntimeSource(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	body := map[string]any{
+		"name":                 "no-source",
+		"runtime_ids":          []string{},
+		"group_ids":            []string{},
+		"visibility":           "private",
+		"max_concurrent_tasks": 1,
+	}
+	w := httptest.NewRecorder()
+	testHandler.CreateAgent(w, newRequest(http.MethodPost, "/api/agents", body))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty runtime_ids + group_ids, got %d", w.Code)
+	}
+}
+
+func TestCreateAgent_WithGroupOnlySucceeds(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	groupID := createRuntimeGroupWithMembers(t, "agent-group-only", []string{testRuntimeID})
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent WHERE workspace_id = $1 AND name = 'group-only-agent'`, testWorkspaceID)
+	})
+
+	body := map[string]any{
+		"name":                 "group-only-agent",
+		"runtime_ids":          []string{},
+		"group_ids":            []string{groupID},
+		"visibility":           "private",
+		"max_concurrent_tasks": 1,
+	}
+	w := httptest.NewRecorder()
+	testHandler.CreateAgent(w, newRequest(http.MethodPost, "/api/agents", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	groups, _ := resp["groups"].([]any)
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 group in response, got %d", len(groups))
+	}
+}
+
+func TestUpdateAgent_PartialRuntimeIDsUsesExistingGroups(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	groupID := createRuntimeGroupWithMembers(t, "partial-update-grp", []string{testRuntimeID})
+	agentID := createAgentWithRuntimesAndGroups(t, []string{testRuntimeID}, []string{groupID})
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID) })
+
+	patch := map[string]any{"runtime_ids": []string{}}
+	w := httptest.NewRecorder()
+	testHandler.UpdateAgent(w, newAuthedRequestWithPath(http.MethodPatch, "/api/agents/"+agentID, patch, agentID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateAgent_EmptyBothSidesRejected(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	groupID := createRuntimeGroupWithMembers(t, "empty-both-grp", []string{testRuntimeID})
+	agentID := createAgentWithRuntimesAndGroups(t, []string{testRuntimeID}, []string{groupID})
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID) })
+
+	patch := map[string]any{"runtime_ids": []string{}, "group_ids": []string{}}
+	w := httptest.NewRecorder()
+	testHandler.UpdateAgent(w, newAuthedRequestWithPath(http.MethodPatch, "/api/agents/"+agentID, patch, agentID))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestUpdateAgent_EmptyRuntimeIDsWithGroupUpdatesRuntimeMode(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	// testRuntimeID is a "cloud" runtime; the group inherits that mode.
+	groupID := createRuntimeGroupWithMembers(t, "mode-derive-grp", []string{testRuntimeID})
+	agentID := createAgentWithRuntimesAndGroups(t, []string{testRuntimeID}, []string{groupID})
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID) })
+
+	// PATCH with runtime_ids: [] — agent retains group, mode must derive from group's cloud runtime.
+	patch := map[string]any{"runtime_ids": []string{}}
+	w := httptest.NewRecorder()
+	testHandler.UpdateAgent(w, newAuthedRequestWithPath(http.MethodPatch, "/api/agents/"+agentID, patch, agentID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	mode, _ := resp["runtime_mode"].(string)
+	if mode != "cloud" {
+		t.Fatalf("expected runtime_mode=cloud after deriving from group, got %q", mode)
+	}
+}
+
 func TestUpdateAgent_PreservesCreatedAtOfSurvivingAssignments(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")

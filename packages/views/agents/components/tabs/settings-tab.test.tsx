@@ -3,7 +3,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 import { SettingsTab } from "./settings-tab";
-import type { Agent, RuntimeDevice, MemberWithUser } from "@multica/core/types";
+import type { Agent, RuntimeDevice, MemberWithUser, RuntimeGroup } from "@multica/core/types";
 
 vi.mock("@multica/core/api", () => ({
   api: {},
@@ -52,6 +52,7 @@ const agent = (runtimeIds: string[]): Agent => ({
     owner_id: "user-1",
     last_used_at: null,
   })),
+  groups: [],
   name: "Test Agent",
   description: "",
   instructions: "",
@@ -79,6 +80,7 @@ describe("SettingsTab", () => {
       <SettingsTab
         agent={a}
         runtimes={[runtime({ id: "rt-1", name: "Workstation" }), runtime({ id: "rt-2", name: "Laptop" })]}
+        groups={[]}
         members={[] as MemberWithUser[]}
         currentUserId="user-1"
         onSave={vi.fn()}
@@ -94,6 +96,7 @@ describe("SettingsTab", () => {
       <SettingsTab
         agent={a}
         runtimes={[runtime({ id: "rt-1" })]}
+        groups={[]}
         members={[] as MemberWithUser[]}
         currentUserId="user-1"
         onSave={vi.fn()}
@@ -102,6 +105,38 @@ describe("SettingsTab", () => {
     fireEvent.click(screen.getByLabelText("Remove Workstation"));
     expect(screen.getByText(/at least one runtime/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /save/i })).toBeDisabled();
+  });
+
+  it("renders a chip per assigned group", () => {
+    const g: RuntimeGroup = { id: "g1", workspace_id: "ws", name: "Team", description: "", runtimes: [], active_override: null, member_agent_count: 1, created_by: null, created_at: "", updated_at: "" };
+    const a = { ...agent(["rt-1"]), groups: [{ id: "g1", name: "Team", active_override: null }] };
+    render(
+      <SettingsTab
+        agent={a}
+        runtimes={[runtime({ id: "rt-1" })]}
+        groups={[g]}
+        members={[] as MemberWithUser[]}
+        currentUserId="user-1"
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Team")).toBeInTheDocument();
+  });
+
+  it("allows save when only groups are selected (no runtimes)", () => {
+    const g: RuntimeGroup = { id: "g1", workspace_id: "ws", name: "Team", description: "", runtimes: [], active_override: null, member_agent_count: 1, created_by: null, created_at: "", updated_at: "" };
+    const a = { ...agent([]), groups: [{ id: "g1", name: "Team", active_override: null }] };
+    render(
+      <SettingsTab
+        agent={a}
+        runtimes={[]}
+        groups={[g]}
+        members={[] as MemberWithUser[]}
+        currentUserId="user-1"
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/at least one runtime/i)).not.toBeInTheDocument();
   });
 
   it("excludes already-assigned runtimes from the Add picker", () => {
@@ -113,6 +148,7 @@ describe("SettingsTab", () => {
           runtime({ id: "rt-1", name: "Workstation" }),
           runtime({ id: "rt-2", name: "Laptop" }),
         ]}
+        groups={[]}
         members={[] as MemberWithUser[]}
         currentUserId="user-1"
         onSave={vi.fn()}

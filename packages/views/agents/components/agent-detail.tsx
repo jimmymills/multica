@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import {
   Cloud,
   Monitor,
@@ -14,7 +14,7 @@ import {
   KeyRound,
   Terminal,
 } from "lucide-react";
-import type { Agent, RuntimeDevice, MemberWithUser } from "@multica/core/types";
+import type { Agent, RuntimeDevice, MemberWithUser, RuntimeGroup } from "@multica/core/types";
 import {
   Dialog,
   DialogContent,
@@ -58,6 +58,7 @@ const detailTabs: { id: DetailTab; label: string; icon: typeof FileText }[] = [
 export function AgentDetail({
   agent,
   runtimes,
+  groups,
   members,
   currentUserId,
   onUpdate,
@@ -66,20 +67,37 @@ export function AgentDetail({
 }: {
   agent: Agent;
   runtimes: RuntimeDevice[];
+  groups: RuntimeGroup[];
   members: MemberWithUser[];
   currentUserId: string | null;
-  onUpdate: (id: string, data: Partial<Agent>) => Promise<void>;
+  onUpdate: (id: string, data: Partial<Agent> & { group_ids?: string[] }) => Promise<void>;
   onArchive: (id: string) => Promise<void>;
   onRestore: (id: string) => Promise<void>;
 }) {
   const st = statusConfig[agent.status];
+
+  const groupSourcedRuntimeIds = useMemo(
+    () => new Set(
+      agent.groups.flatMap((g) => {
+        const full = groups.find((wg) => wg.id === g.id);
+        return full?.runtimes.map((r) => r.id) ?? [];
+      }),
+    ),
+    [agent.groups, groups],
+  );
+  const effectiveRuntimeIds = useMemo(
+    () => new Set<string>([...agent.runtime_ids, ...groupSourcedRuntimeIds]),
+    [agent.runtime_ids, groupSourcedRuntimeIds],
+  );
+  const activeOverrides = agent.groups.filter((g) => g.active_override);
+
   const assignedRuntimes = getAssignedRuntimes(agent, runtimes);
   const hasCloudRuntime = assignedRuntimes.some((r) => r.runtime_mode === "cloud");
   const runtimeBadge =
-    assignedRuntimes.length === 1
-      ? assignedRuntimes[0]!.name
-      : assignedRuntimes.length > 1
-        ? `${assignedRuntimes.length} runtimes`
+    effectiveRuntimeIds.size === 1
+      ? (assignedRuntimes[0]?.name ?? "1 runtime")
+      : effectiveRuntimeIds.size > 1
+        ? `${effectiveRuntimeIds.size} runtimes`
         : agent.runtime_mode === "cloud" ? "Cloud" : "Local";
   const [activeTab, setActiveTab] = useState<DetailTab>("instructions");
   const [confirmArchive, setConfirmArchive] = useState(false);
@@ -124,6 +142,14 @@ export function AgentDetail({
                 <Monitor className="h-3 w-3" />
               )}
               {runtimeBadge}
+              {activeOverrides.length > 0 && (
+                <span
+                  className="h-2 w-2 rounded-full bg-amber-500"
+                  title={activeOverrides
+                    .map((g) => `${g.name}: ${g.active_override!.runtime_name} until ${new Date(g.active_override!.ends_at).toLocaleString()}`)
+                    .join("\n")}
+                />
+              )}
             </span>
           </div>
         </div>
@@ -196,6 +222,7 @@ export function AgentDetail({
           <SettingsTab
             agent={agent}
             runtimes={runtimes}
+            groups={groups}
             members={members}
             currentUserId={currentUserId}
             onSave={(updates) => onUpdate(agent.id, updates)}

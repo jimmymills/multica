@@ -63,6 +63,12 @@ type AgentRuntimeAssignment struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type AgentRuntimeGroup struct {
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	GroupID   pgtype.UUID        `json:"group_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type AgentSkill struct {
 	AgentID   pgtype.UUID        `json:"agent_id"`
 	SkillID   pgtype.UUID        `json:"skill_id"`
@@ -398,6 +404,33 @@ type Project struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	Priority    string             `json:"priority"`
+}
+
+type RuntimeGroup struct {
+	ID          pgtype.UUID        `json:"id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RuntimeGroupMember struct {
+	GroupID   pgtype.UUID        `json:"group_id"`
+	RuntimeID pgtype.UUID        `json:"runtime_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type RuntimeGroupOverride struct {
+	ID        pgtype.UUID        `json:"id"`
+	GroupID   pgtype.UUID        `json:"group_id"`
+	RuntimeID pgtype.UUID        `json:"runtime_id"`
+	StartsAt  pgtype.Timestamptz `json:"starts_at"`
+	EndsAt    pgtype.Timestamptz `json:"ends_at"`
+	CreatedBy pgtype.UUID        `json:"created_by"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Skill struct {

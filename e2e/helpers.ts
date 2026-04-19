@@ -20,7 +20,7 @@ export async function loginAsDefault(page: Page): Promise<string> {
     DEFAULT_E2E_WORKSPACE,
   );
 
-  const token = api.getToken();
+  const token = api.getToken()!;
   await page.goto("/login");
   await page.evaluate((t) => {
     localStorage.setItem("multica_token", t);

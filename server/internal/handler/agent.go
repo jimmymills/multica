@@ -28,28 +28,42 @@ type AgentRuntimeRef struct {
 	LastUsedAt  *string `json:"last_used_at"`
 }
 
+type AgentRuntimeGroupRefOverride struct {
+	RuntimeID   string `json:"runtime_id"`
+	RuntimeName string `json:"runtime_name"`
+	EndsAt      string `json:"ends_at"`
+}
+
+type AgentRuntimeGroupRef struct {
+	ID             string                        `json:"id"`
+	Name           string                        `json:"name"`
+	ActiveOverride *AgentRuntimeGroupRefOverride `json:"active_override"`
+}
+
 type AgentResponse struct {
-	ID                 string            `json:"id"`
-	WorkspaceID        string            `json:"workspace_id"`
-	Name               string            `json:"name"`
-	Description        string            `json:"description"`
-	Instructions       string            `json:"instructions"`
-	AvatarURL          *string           `json:"avatar_url"`
-	RuntimeMode        string            `json:"runtime_mode"`
-	RuntimeConfig      any               `json:"runtime_config"`
-	CustomEnv          map[string]string `json:"custom_env"`
-	CustomArgs         []string          `json:"custom_args"`
-	CustomEnvRedacted  bool              `json:"custom_env_redacted"`
-	Visibility         string            `json:"visibility"`
-	Status             string            `json:"status"`
-	MaxConcurrentTasks int32             `json:"max_concurrent_tasks"`
-	OwnerID            *string           `json:"owner_id"`
-	Skills             []SkillResponse   `json:"skills"`
-	Runtimes           []AgentRuntimeRef `json:"runtimes"`
-	CreatedAt          string            `json:"created_at"`
-	UpdatedAt          string            `json:"updated_at"`
-	ArchivedAt         *string           `json:"archived_at"`
-	ArchivedBy         *string           `json:"archived_by"`
+	ID                 string                 `json:"id"`
+	WorkspaceID        string                 `json:"workspace_id"`
+	Name               string                 `json:"name"`
+	Description        string                 `json:"description"`
+	Instructions       string                 `json:"instructions"`
+	AvatarURL          *string                `json:"avatar_url"`
+	RuntimeMode        string                 `json:"runtime_mode"`
+	RuntimeConfig      any                    `json:"runtime_config"`
+	CustomEnv          map[string]string      `json:"custom_env"`
+	CustomArgs         []string               `json:"custom_args"`
+	CustomEnvRedacted  bool                   `json:"custom_env_redacted"`
+	Visibility         string                 `json:"visibility"`
+	Status             string                 `json:"status"`
+	MaxConcurrentTasks int32                  `json:"max_concurrent_tasks"`
+	OwnerID            *string                `json:"owner_id"`
+	Skills             []SkillResponse        `json:"skills"`
+	RuntimeIDs         []string               `json:"runtime_ids"`
+	Runtimes           []AgentRuntimeRef      `json:"runtimes"`
+	Groups             []AgentRuntimeGroupRef `json:"groups"`
+	CreatedAt          string                 `json:"created_at"`
+	UpdatedAt          string                 `json:"updated_at"`
+	ArchivedAt         *string                `json:"archived_at"`
+	ArchivedBy         *string                `json:"archived_by"`
 }
 
 func agentToResponse(a db.Agent) AgentResponse {
@@ -97,7 +111,9 @@ func agentToResponse(a db.Agent) AgentResponse {
 		MaxConcurrentTasks: a.MaxConcurrentTasks,
 		OwnerID:            uuidToPtr(a.OwnerID),
 		Skills:             []SkillResponse{},
+		RuntimeIDs:         []string{},
 		Runtimes:           []AgentRuntimeRef{},
+		Groups:             []AgentRuntimeGroupRef{},
 		CreatedAt:          timestampToString(a.CreatedAt),
 		UpdatedAt:          timestampToString(a.UpdatedAt),
 		ArchivedAt:         timestampToPtr(a.ArchivedAt),
@@ -130,7 +146,9 @@ func (h *Handler) buildAgentResponse(ctx context.Context, a db.Agent) (AgentResp
 		return resp, fmt.Errorf("list assignments: %w", err)
 	}
 	resp.Runtimes = make([]AgentRuntimeRef, len(assignments))
+	resp.RuntimeIDs = make([]string, len(assignments))
 	for i, asn := range assignments {
+		resp.RuntimeIDs[i] = uuidToString(asn.RuntimeID)
 		resp.Runtimes[i] = AgentRuntimeRef{
 			ID:          uuidToString(asn.RuntimeID),
 			Name:        asn.RuntimeName,
@@ -141,6 +159,27 @@ func (h *Handler) buildAgentResponse(ctx context.Context, a db.Agent) (AgentResp
 			OwnerID:     uuidToPtr(asn.RuntimeOwnerID),
 			LastUsedAt:  timestampToPtr(asn.LastUsedAt),
 		}
+	}
+
+	groups, err := h.Queries.ListAgentRuntimeGroupsByAgent(ctx, a.ID)
+	if err != nil {
+		return resp, fmt.Errorf("list agent groups: %w", err)
+	}
+	resp.Groups = make([]AgentRuntimeGroupRef, 0, len(groups))
+	for _, g := range groups {
+		ref := AgentRuntimeGroupRef{
+			ID:   uuidToString(g.GroupID),
+			Name: g.GroupName,
+		}
+		active, err := h.Queries.GetActiveRuntimeGroupOverride(ctx, g.GroupID)
+		if err == nil {
+			ref.ActiveOverride = &AgentRuntimeGroupRefOverride{
+				RuntimeID:   uuidToString(active.RuntimeID),
+				RuntimeName: active.RuntimeName,
+				EndsAt:      timestampToString(active.EndsAt),
+			}
+		}
+		resp.Groups = append(resp.Groups, ref)
 	}
 
 	return resp, nil
@@ -268,6 +307,38 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	groupRows, err := h.Queries.ListAgentRuntimeGroupsByWorkspace(r.Context(), parseUUID(workspaceID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load agent groups")
+		return
+	}
+	overrideRows, err := h.Queries.ListActiveRuntimeGroupOverridesByWorkspace(r.Context(), parseUUID(workspaceID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load active overrides")
+		return
+	}
+	overridesByGroup := map[string]AgentRuntimeGroupRefOverride{}
+	for _, o := range overrideRows {
+		overridesByGroup[uuidToString(o.GroupID)] = AgentRuntimeGroupRefOverride{
+			RuntimeID:   uuidToString(o.RuntimeID),
+			RuntimeName: o.RuntimeName,
+			EndsAt:      timestampToString(o.EndsAt),
+		}
+	}
+	groupsByAgent := map[string][]AgentRuntimeGroupRef{}
+	for _, row := range groupRows {
+		aid := uuidToString(row.AgentID)
+		ref := AgentRuntimeGroupRef{
+			ID:   uuidToString(row.GroupID),
+			Name: row.GroupName,
+		}
+		if o, ok := overridesByGroup[ref.ID]; ok {
+			oCopy := o
+			ref.ActiveOverride = &oCopy
+		}
+		groupsByAgent[aid] = append(groupsByAgent[aid], ref)
+	}
+
 	// All agents (including private) are visible to workspace members.
 	visible := make([]AgentResponse, 0, len(agents))
 	for _, a := range agents {
@@ -278,6 +349,14 @@ func (h *Handler) ListAgents(w http.ResponseWriter, r *http.Request) {
 		}
 		if rts := runtimesByAgent[aid]; rts != nil {
 			resp.Runtimes = rts
+			ids := make([]string, len(rts))
+			for i, rt := range rts {
+				ids[i] = rt.ID
+			}
+			resp.RuntimeIDs = ids
+		}
+		if grps := groupsByAgent[aid]; grps != nil {
+			resp.Groups = grps
 		}
 		// Redact custom_env for users who are not the agent owner or workspace owner/admin.
 		if !canViewAgentEnv(a, userID, member.Role) {
@@ -318,6 +397,7 @@ type CreateAgentRequest struct {
 	Instructions       string            `json:"instructions"`
 	AvatarURL          *string           `json:"avatar_url"`
 	RuntimeIDs         []string          `json:"runtime_ids"`
+	GroupIDs           []string          `json:"group_ids"`
 	RuntimeConfig      any               `json:"runtime_config"`
 	CustomEnv          map[string]string `json:"custom_env"`
 	CustomArgs         []string          `json:"custom_args"`
@@ -343,8 +423,8 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if len(req.RuntimeIDs) == 0 {
-		writeError(w, http.StatusBadRequest, "runtime_ids must contain at least one runtime")
+	if len(req.RuntimeIDs) == 0 && len(req.GroupIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "at least one runtime_id or group_id is required")
 		return
 	}
 	if req.Visibility == "" {
@@ -376,6 +456,21 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		if i == 0 {
 			primaryMode = rt.RuntimeMode
 		}
+	}
+	if primaryMode == "" {
+		primaryMode = "local"
+	}
+
+	groupUUIDs := make([]pgtype.UUID, 0, len(req.GroupIDs))
+	for _, gid := range req.GroupIDs {
+		if _, err := h.Queries.GetRuntimeGroupInWorkspace(r.Context(), db.GetRuntimeGroupInWorkspaceParams{
+			ID:          parseUUID(gid),
+			WorkspaceID: parseUUID(workspaceID),
+		}); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid group_id: %s", gid))
+			return
+		}
+		groupUUIDs = append(groupUUIDs, parseUUID(gid))
 	}
 
 	rc, _ := json.Marshal(req.RuntimeConfig)
@@ -446,6 +541,22 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	for _, gid := range groupUUIDs {
+		if err := qtx.AddAgentRuntimeGroup(r.Context(), db.AddAgentRuntimeGroupParams{
+			AgentID: agent.ID,
+			GroupID: gid,
+		}); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+				writeError(w, http.StatusBadRequest, "invalid group_id")
+				return
+			}
+			slog.Warn("add agent runtime group failed", "agent_id", uuidToString(agent.ID), "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to assign group")
+			return
+		}
+	}
+
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to commit transaction")
 		return
@@ -470,17 +581,18 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 type UpdateAgentRequest struct {
-	Name               *string    `json:"name"`
-	Description        *string    `json:"description"`
-	Instructions       *string    `json:"instructions"`
-	AvatarURL          *string    `json:"avatar_url"`
-	RuntimeIDs         *[]string  `json:"runtime_ids"`
-	RuntimeConfig      any        `json:"runtime_config"`
+	Name               *string            `json:"name"`
+	Description        *string            `json:"description"`
+	Instructions       *string            `json:"instructions"`
+	AvatarURL          *string            `json:"avatar_url"`
+	RuntimeIDs         *[]string          `json:"runtime_ids"`
+	GroupIDs           *[]string          `json:"group_ids"`
+	RuntimeConfig      any                `json:"runtime_config"`
 	CustomEnv          *map[string]string `json:"custom_env"`
-	CustomArgs         *[]string  `json:"custom_args"`
-	Visibility         *string    `json:"visibility"`
-	Status             *string    `json:"status"`
-	MaxConcurrentTasks *int32     `json:"max_concurrent_tasks"`
+	CustomArgs         *[]string          `json:"custom_args"`
+	Visibility         *string            `json:"visibility"`
+	Status             *string            `json:"status"`
+	MaxConcurrentTasks *int32             `json:"max_concurrent_tasks"`
 }
 
 // canViewAgentEnv checks whether the requesting user is allowed to see the
@@ -539,14 +651,31 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce combined invariant: after this update the agent must still have
+	// at least one runtime source (direct runtime or group).
+	effectiveRuntimeCount := 0
+	effectiveGroupCount := 0
+	if req.RuntimeIDs != nil {
+		effectiveRuntimeCount = len(*req.RuntimeIDs)
+	} else {
+		n, _ := h.Queries.CountAgentRuntimeAssignments(r.Context(), parseUUID(id))
+		effectiveRuntimeCount = int(n)
+	}
+	if req.GroupIDs != nil {
+		effectiveGroupCount = len(*req.GroupIDs)
+	} else {
+		grps, _ := h.Queries.ListAgentRuntimeGroupsByAgent(r.Context(), parseUUID(id))
+		effectiveGroupCount = len(grps)
+	}
+	if effectiveRuntimeCount == 0 && effectiveGroupCount == 0 {
+		writeError(w, http.StatusBadRequest, "at least one runtime_id or group_id is required")
+		return
+	}
+
 	// Validate runtime_ids if provided.
 	var runtimeUUIDs []pgtype.UUID
 	var primaryMode string
 	if req.RuntimeIDs != nil {
-		if len(*req.RuntimeIDs) == 0 {
-			writeError(w, http.StatusBadRequest, "runtime_ids must contain at least one runtime")
-			return
-		}
 		runtimeUUIDs = make([]pgtype.UUID, 0, len(*req.RuntimeIDs))
 		for i, rid := range *req.RuntimeIDs {
 			rt, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
@@ -593,6 +722,32 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.RuntimeIDs != nil && len(runtimeUUIDs) > 0 && primaryMode != "" {
 		params.RuntimeMode = pgtype.Text{String: primaryMode, Valid: true}
+	} else if req.RuntimeIDs != nil && len(runtimeUUIDs) == 0 {
+		// runtime_ids set to empty — derive mode from groups instead.
+		var groupIDsToCheck []pgtype.UUID
+		if req.GroupIDs != nil {
+			for _, gid := range *req.GroupIDs {
+				groupIDsToCheck = append(groupIDsToCheck, parseUUID(gid))
+			}
+		} else {
+			existing, _ := h.Queries.ListAgentRuntimeGroupsByAgent(r.Context(), parseUUID(id))
+			for _, g := range existing {
+				groupIDsToCheck = append(groupIDsToCheck, g.GroupID)
+			}
+		}
+		for _, gid := range groupIDsToCheck {
+			members, _ := h.Queries.ListRuntimeGroupMembers(r.Context(), gid)
+			if len(members) > 0 {
+				rt, err := h.Queries.GetAgentRuntimeForWorkspace(r.Context(), db.GetAgentRuntimeForWorkspaceParams{
+					ID:          members[0].RuntimeID,
+					WorkspaceID: agent.WorkspaceID,
+				})
+				if err == nil {
+					params.RuntimeMode = pgtype.Text{String: rt.RuntimeMode, Valid: true}
+				}
+				break
+			}
+		}
 	}
 	if req.Visibility != nil {
 		params.Visibility = pgtype.Text{String: *req.Visibility, Valid: true}
@@ -621,7 +776,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(runtimeUUIDs) > 0 {
+	if req.RuntimeIDs != nil {
 		// Add new assignments first (ON CONFLICT DO NOTHING preserves created_at
 		// for surviving rows), then prune assignments not in the new set.
 		for _, rtID := range runtimeUUIDs {
@@ -645,6 +800,42 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			slog.Warn("prune agent runtime assignments failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
 			writeError(w, http.StatusInternalServerError, "failed to prune runtime assignments")
+			return
+		}
+	}
+
+	if req.GroupIDs != nil {
+		groupUUIDs := make([]pgtype.UUID, len(*req.GroupIDs))
+		for i, gid := range *req.GroupIDs {
+			if _, err := h.Queries.GetRuntimeGroupInWorkspace(r.Context(), db.GetRuntimeGroupInWorkspaceParams{
+				ID:          parseUUID(gid),
+				WorkspaceID: agent.WorkspaceID,
+			}); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid group_id: %s", gid))
+				return
+			}
+			groupUUIDs[i] = parseUUID(gid)
+		}
+		for _, gid := range groupUUIDs {
+			if err := qtx.AddAgentRuntimeGroup(r.Context(), db.AddAgentRuntimeGroupParams{
+				AgentID: agent.ID,
+				GroupID: gid,
+			}); err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+					writeError(w, http.StatusBadRequest, "invalid group_id")
+					return
+				}
+				slog.Warn("add agent runtime group failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
+				writeError(w, http.StatusInternalServerError, "failed to add group link")
+				return
+			}
+		}
+		if err := qtx.RemoveAgentRuntimeGroupsNotIn(r.Context(), db.RemoveAgentRuntimeGroupsNotInParams{
+			AgentID:  agent.ID,
+			GroupIds: groupUUIDs,
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to prune group links")
 			return
 		}
 	}

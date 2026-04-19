@@ -8,6 +8,7 @@ import type {
   AgentVisibility,
   RuntimeDevice,
   MemberWithUser,
+  RuntimeGroup,
   CreateAgentRequest,
 } from "@multica/core/types";
 import {
@@ -33,6 +34,7 @@ type RuntimeFilter = "mine" | "all";
 export function CreateAgentDialog({
   runtimes,
   runtimesLoading,
+  groups,
   members,
   currentUserId,
   onClose,
@@ -40,6 +42,7 @@ export function CreateAgentDialog({
 }: {
   runtimes: RuntimeDevice[];
   runtimesLoading?: boolean;
+  groups: RuntimeGroup[];
   members: MemberWithUser[];
   currentUserId: string | null;
   onClose: () => void;
@@ -50,6 +53,8 @@ export function CreateAgentDialog({
   const [visibility, setVisibility] = useState<AgentVisibility>("private");
   const [creating, setCreating] = useState(false);
   const [addRuntimeOpen, setAddRuntimeOpen] = useState(false);
+  const [addGroupOpen, setAddGroupOpen] = useState(false);
+  const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>([]);
   const [runtimeFilter, setRuntimeFilter] = useState<RuntimeFilter>("mine");
 
   const getOwnerMember = (ownerId: string | null) => {
@@ -86,7 +91,16 @@ export function CreateAgentDialog({
     [filteredRuntimes, selectedRuntimeIds],
   );
 
-  const canSubmit = !creating && name.trim().length > 0 && selectedRuntimeIds.length > 0;
+  const selectedGroupObjects = useMemo(
+    () => selectedGroupIds.map((id) => groups.find((g) => g.id === id)).filter(Boolean) as RuntimeGroup[],
+    [selectedGroupIds, groups],
+  );
+  const candidateGroups = useMemo(
+    () => groups.filter((g) => !selectedGroupIds.includes(g.id)),
+    [groups, selectedGroupIds],
+  );
+
+  const canSubmit = !creating && name.trim().length > 0 && (selectedRuntimeIds.length + selectedGroupIds.length) > 0;
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
@@ -96,6 +110,7 @@ export function CreateAgentDialog({
         name: name.trim(),
         description: description.trim(),
         runtime_ids: selectedRuntimeIds,
+        group_ids: selectedGroupIds,
         visibility,
       });
       onClose();
@@ -173,6 +188,54 @@ export function CreateAgentDialog({
                   <div className="text-xs text-muted-foreground">Only you can assign</div>
                 </div>
               </button>
+            </div>
+          </div>
+
+          <div>
+            <Label className="text-xs text-muted-foreground">Groups</Label>
+            <div className="mt-1.5 flex flex-wrap gap-2">
+              {selectedGroupObjects.map((g) => (
+                <div key={g.id} className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm">
+                  <span className="truncate font-medium">{g.name}</span>
+                  {g.active_override && (
+                    <span
+                      className="shrink-0 rounded bg-amber-500/10 px-1.5 py-0.5 text-xs font-medium text-amber-600"
+                      title={`Overridden to ${g.active_override.runtime_name} until ${new Date(g.active_override.ends_at).toLocaleString()}`}
+                    >
+                      Override
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${g.name}`}
+                    onClick={() => setSelectedGroupIds((ids) => ids.filter((id) => id !== g.id))}
+                    className="ml-1 text-muted-foreground hover:text-foreground"
+                  >×</button>
+                </div>
+              ))}
+              <Popover open={addGroupOpen} onOpenChange={setAddGroupOpen}>
+                <PopoverTrigger
+                  disabled={candidateGroups.length === 0}
+                  className="rounded-lg border border-dashed border-border bg-background px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
+                >+ Add group</PopoverTrigger>
+                <PopoverContent align="start" className="w-72 p-1 max-h-60 overflow-y-auto">
+                  {candidateGroups.map((g) => (
+                    <button
+                      key={g.id}
+                      role="menuitem"
+                      onClick={() => { setSelectedGroupIds((ids) => [...ids, g.id]); setAddGroupOpen(false); }}
+                      className="flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm hover:bg-accent/50"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate font-medium">{g.name}</div>
+                        <div className="truncate text-xs text-muted-foreground">
+                          {g.runtimes.length} runtime{g.runtimes.length === 1 ? "" : "s"}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </PopoverContent>
+              </Popover>
             </div>
           </div>
 
@@ -298,7 +361,7 @@ export function CreateAgentDialog({
               </div>
             )}
 
-            {!runtimesLoading && selectedRuntimeIds.length === 0 && (
+            {!runtimesLoading && selectedRuntimeIds.length === 0 && selectedGroupIds.length === 0 && (
               <p className="mt-2 text-xs text-destructive">
                 {runtimes.length === 0
                   ? "Register a runtime before creating an agent."

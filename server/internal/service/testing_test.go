@@ -15,6 +15,15 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// newUUID returns a fresh random pgtype.UUID.
+func newUUID() pgtype.UUID {
+	var id pgtype.UUID
+	if err := id.Scan(uuid.NewString()); err != nil {
+		panic(err)
+	}
+	return id
+}
+
 var (
 	testPool        *pgxpool.Pool
 	testWorkspaceID pgtype.UUID
@@ -158,6 +167,24 @@ func setupTaskServiceTest(t *testing.T) (*TaskService, testContext) {
 		testPool.Exec(bgCtx, `
 			DELETE FROM issue WHERE workspace_id = $1 AND title LIKE 'test-issue-%'
 		`, testWorkspaceID)
+		// Runtime group tables — must run before agent_runtime to satisfy FKs.
+		testPool.Exec(bgCtx, `
+			DELETE FROM runtime_group_override
+			WHERE group_id IN (SELECT id FROM runtime_group WHERE workspace_id = $1)
+		`, testWorkspaceID)
+		testPool.Exec(bgCtx, `
+			DELETE FROM runtime_group_member
+			WHERE group_id IN (SELECT id FROM runtime_group WHERE workspace_id = $1)
+		`, testWorkspaceID)
+		testPool.Exec(bgCtx, `
+			DELETE FROM agent_runtime_group
+			WHERE agent_id IN (
+				SELECT id FROM agent WHERE workspace_id = $1 AND name LIKE 'test-agent-%'
+			)
+		`, testWorkspaceID)
+		testPool.Exec(bgCtx, `
+			DELETE FROM runtime_group WHERE workspace_id = $1
+		`, testWorkspaceID)
 		testPool.Exec(bgCtx, `
 			DELETE FROM agent_runtime WHERE workspace_id = $1 AND name LIKE 'test-rt-%'
 		`, testWorkspaceID)
@@ -275,4 +302,85 @@ func (tc *testContext) seedUsage(t *testing.T, runtimeID pgtype.UUID, tokens int
 	`, taskID, tokens, at); err != nil {
 		t.Fatalf("seedUsage: %v", err)
 	}
+}
+
+// createGroup inserts a runtime_group with the given member runtimes and returns the group UUID.
+func (tc *testContext) createGroup(t *testing.T, runtimes []pgtype.UUID) pgtype.UUID {
+	t.Helper()
+	groupID := newUUID()
+	_, err := testPool.Exec(tc.ctx,
+		`INSERT INTO runtime_group (id, workspace_id, name) VALUES ($1, $2, $3)`,
+		groupID, testWorkspaceID, "test-grp-"+uuid.NewString(),
+	)
+	if err != nil {
+		t.Fatalf("createGroup: %v", err)
+	}
+	for _, rid := range runtimes {
+		_, err := testPool.Exec(tc.ctx,
+			`INSERT INTO runtime_group_member (group_id, runtime_id) VALUES ($1, $2)`,
+			groupID, rid,
+		)
+		if err != nil {
+			t.Fatalf("createGroup insert member: %v", err)
+		}
+	}
+	return groupID
+}
+
+// linkAgentToGroup inserts an agent_runtime_group row associating the agent with the group.
+func (tc *testContext) linkAgentToGroup(t *testing.T, agentID, groupID pgtype.UUID) {
+	t.Helper()
+	_, err := testPool.Exec(tc.ctx,
+		`INSERT INTO agent_runtime_group (agent_id, group_id) VALUES ($1, $2)`,
+		agentID, groupID,
+	)
+	if err != nil {
+		t.Fatalf("linkAgentToGroup: %v", err)
+	}
+}
+
+// setOverride inserts an active runtime_group_override (starts_at=now, ends_at=endsAt).
+func (tc *testContext) setOverride(t *testing.T, groupID, runtimeID pgtype.UUID, endsAt time.Time) {
+	t.Helper()
+	_, err := testPool.Exec(tc.ctx,
+		`INSERT INTO runtime_group_override (group_id, runtime_id, starts_at, ends_at) VALUES ($1, $2, now(), $3)`,
+		groupID, runtimeID, endsAt,
+	)
+	if err != nil {
+		t.Fatalf("setOverride: %v", err)
+	}
+}
+
+// createRuntimeInOtherWorkspace creates a separate workspace + runtime and
+// returns the runtime UUID. Used to test cross-workspace rejection.
+func (tc *testContext) createRuntimeInOtherWorkspace(t *testing.T) pgtype.UUID {
+	t.Helper()
+	wsID := newUUID()
+	_, err := testPool.Exec(tc.ctx,
+		`INSERT INTO workspace (id, name, slug, description, issue_prefix)
+		 VALUES ($1, $2, $3, '', 'TST')`,
+		wsID,
+		"service-test-other-"+uuid.NewString(),
+		"svc-test-other-"+uuid.NewString(),
+	)
+	if err != nil {
+		t.Fatalf("createRuntimeInOtherWorkspace: insert workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id = $1`, wsID)
+	})
+
+	rtID := newUUID()
+	_, err = testPool.Exec(tc.ctx,
+		`INSERT INTO agent_runtime (id, workspace_id, name, runtime_mode, provider,
+		 status, device_info, metadata, last_seen_at)
+		 VALUES ($1, $2, $3, 'local', 'claude', 'online', '', '{}'::jsonb, now())`,
+		rtID,
+		wsID,
+		"test-rt-other-"+uuid.NewString(),
+	)
+	if err != nil {
+		t.Fatalf("createRuntimeInOtherWorkspace: insert runtime: %v", err)
+	}
+	return rtID
 }
