@@ -19,9 +19,9 @@ WHERE id = $1 AND workspace_id = $2;
 -- name: CreateAgent :one
 INSERT INTO agent (
     workspace_id, name, description, avatar_url, runtime_mode,
-    runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id,
+    runtime_config, visibility, max_concurrent_tasks, owner_id,
     instructions, custom_env, custom_args
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 RETURNING *;
 
 -- name: UpdateAgent :one
@@ -31,7 +31,6 @@ UPDATE agent SET
     avatar_url = COALESCE(sqlc.narg('avatar_url'), avatar_url),
     runtime_config = COALESCE(sqlc.narg('runtime_config'), runtime_config),
     runtime_mode = COALESCE(sqlc.narg('runtime_mode'), runtime_mode),
-    runtime_id = COALESCE(sqlc.narg('runtime_id'), runtime_id),
     visibility = COALESCE(sqlc.narg('visibility'), visibility),
     status = COALESCE(sqlc.narg('status'), status),
     max_concurrent_tasks = COALESCE(sqlc.narg('max_concurrent_tasks'), max_concurrent_tasks),
@@ -186,3 +185,79 @@ ORDER BY created_at DESC;
 UPDATE agent SET status = $2, updated_at = now()
 WHERE id = $1
 RETURNING *;
+
+-- name: SelectRuntimeForAgent :one
+-- Picks the least-busy runtime among the agent's assigned runtimes, using
+-- 7-day token usage as the primary signal and most recent enqueue as the
+-- LRU tiebreak. Online runtimes are preferred; if every assigned runtime
+-- is offline the query still returns one so enqueue never fails for this
+-- reason (matches current single-runtime behavior).
+WITH window_since AS (
+    SELECT DATE_TRUNC('day', now() - INTERVAL '7 days', 'UTC') AS ts
+),
+runtime_load AS (
+    SELECT
+        atq.runtime_id,
+        COALESCE(SUM(tu.input_tokens + tu.output_tokens
+                   + tu.cache_read_tokens + tu.cache_write_tokens), 0) AS tokens_7d,
+        MAX(atq.created_at) AS last_used_at
+    FROM agent_task_queue atq
+    LEFT JOIN task_usage tu
+        ON tu.task_id = atq.id
+       AND tu.created_at >= (SELECT ts FROM window_since)
+    WHERE atq.runtime_id IN (
+        SELECT runtime_id FROM agent_runtime_assignment WHERE agent_id = $1
+    )
+    GROUP BY atq.runtime_id
+)
+SELECT ara.runtime_id
+FROM agent_runtime_assignment ara
+JOIN agent_runtime r ON r.id = ara.runtime_id
+LEFT JOIN runtime_load rl ON rl.runtime_id = ara.runtime_id
+WHERE ara.agent_id = $1
+ORDER BY
+    (r.status = 'online') DESC,
+    COALESCE(rl.tokens_7d, 0) ASC,
+    rl.last_used_at ASC NULLS FIRST
+LIMIT 1;
+
+-- name: ListAgentRuntimeAssignments :many
+-- Returns one row per assigned runtime with a "last used" timestamp
+-- derived from the most recent task enqueued to that runtime (any agent).
+-- The UI uses this for the runtime chip list and the "last used Xd ago"
+-- label.
+SELECT
+    ar.id            AS runtime_id,
+    ar.name          AS runtime_name,
+    ar.status        AS runtime_status,
+    ar.runtime_mode  AS runtime_mode,
+    ar.provider      AS runtime_provider,
+    ar.owner_id      AS runtime_owner_id,
+    ar.device_info   AS runtime_device_info,
+    last_seen.last_used_at AS last_used_at
+FROM agent_runtime_assignment ara
+JOIN agent_runtime ar ON ar.id = ara.runtime_id
+LEFT JOIN LATERAL (
+    SELECT MAX(atq.created_at) AS last_used_at
+    FROM agent_task_queue atq
+    WHERE atq.runtime_id = ara.runtime_id
+) last_seen ON TRUE
+WHERE ara.agent_id = $1
+ORDER BY ara.created_at ASC;
+
+-- name: AddAgentRuntimeAssignment :exec
+-- Adds a single (agent_id, runtime_id) pair. No-op if it already exists;
+-- keeps the existing created_at.
+INSERT INTO agent_runtime_assignment (agent_id, runtime_id)
+VALUES ($1, $2)
+ON CONFLICT (agent_id, runtime_id) DO NOTHING;
+
+-- name: RemoveAgentRuntimeAssignmentsNotIn :exec
+-- Deletes all assignments for this agent whose runtime_id is not in the
+-- provided array. Called by SetAgentRuntimes after inserting the new set.
+DELETE FROM agent_runtime_assignment
+WHERE agent_id = $1
+  AND runtime_id <> ALL(@runtime_ids::uuid[]);
+
+-- name: CountAgentRuntimeAssignments :one
+SELECT count(*) FROM agent_runtime_assignment WHERE agent_id = $1;

@@ -12,7 +12,9 @@ import (
 )
 
 const countActiveAgentsByRuntime = `-- name: CountActiveAgentsByRuntime :one
-SELECT count(*) FROM agent WHERE runtime_id = $1 AND archived_at IS NULL
+SELECT count(*) FROM agent a
+JOIN agent_runtime_assignment ara ON ara.agent_id = a.id
+WHERE ara.runtime_id = $1 AND a.archived_at IS NULL
 `
 
 func (q *Queries) CountActiveAgentsByRuntime(ctx context.Context, runtimeID pgtype.UUID) (int64, error) {
@@ -32,7 +34,11 @@ func (q *Queries) DeleteAgentRuntime(ctx context.Context, id pgtype.UUID) error 
 }
 
 const deleteArchivedAgentsByRuntime = `-- name: DeleteArchivedAgentsByRuntime :exec
-DELETE FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL
+DELETE FROM agent WHERE id IN (
+    SELECT a.id FROM agent a
+    JOIN agent_runtime_assignment ara ON ara.agent_id = a.id
+    WHERE ara.runtime_id = $1 AND a.archived_at IS NOT NULL
+)
 `
 
 func (q *Queries) DeleteArchivedAgentsByRuntime(ctx context.Context, runtimeID pgtype.UUID) error {
@@ -357,7 +363,7 @@ func (q *Queries) MarkStaleRuntimesOffline(ctx context.Context, staleSeconds flo
 }
 
 const reassignAgentsToRuntime = `-- name: ReassignAgentsToRuntime :execrows
-UPDATE agent
+UPDATE agent_runtime_assignment
 SET runtime_id = $1
 WHERE runtime_id = $2
 `
@@ -367,7 +373,7 @@ type ReassignAgentsToRuntimeParams struct {
 	OldRuntimeID pgtype.UUID `json:"old_runtime_id"`
 }
 
-// Re-points every agent referencing old_runtime_id at new_runtime_id.
+// Re-points every assignment referencing old_runtime_id to new_runtime_id.
 func (q *Queries) ReassignAgentsToRuntime(ctx context.Context, arg ReassignAgentsToRuntimeParams) (int64, error) {
 	result, err := q.db.Exec(ctx, reassignAgentsToRuntime, arg.NewRuntimeID, arg.OldRuntimeID)
 	if err != nil {

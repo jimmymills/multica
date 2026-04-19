@@ -74,10 +74,16 @@ ORDER BY created_at ASC;
 DELETE FROM agent_runtime WHERE id = $1;
 
 -- name: CountActiveAgentsByRuntime :one
-SELECT count(*) FROM agent WHERE runtime_id = $1 AND archived_at IS NULL;
+SELECT count(*) FROM agent a
+JOIN agent_runtime_assignment ara ON ara.agent_id = a.id
+WHERE ara.runtime_id = $1 AND a.archived_at IS NULL;
 
 -- name: DeleteArchivedAgentsByRuntime :exec
-DELETE FROM agent WHERE runtime_id = $1 AND archived_at IS NOT NULL;
+DELETE FROM agent WHERE id IN (
+    SELECT a.id FROM agent a
+    JOIN agent_runtime_assignment ara ON ara.agent_id = a.id
+    WHERE ara.runtime_id = $1 AND a.archived_at IS NOT NULL
+);
 
 -- name: FindLegacyRuntimesByDaemonID :many
 -- Looks up runtime rows keyed on a prior (hostname-derived) daemon_id. Used
@@ -101,8 +107,8 @@ WHERE workspace_id = @workspace_id
   AND LOWER(daemon_id) = LOWER(@daemon_id);
 
 -- name: ReassignAgentsToRuntime :execrows
--- Re-points every agent referencing old_runtime_id at new_runtime_id.
-UPDATE agent
+-- Re-points every assignment referencing old_runtime_id to new_runtime_id.
+UPDATE agent_runtime_assignment
 SET runtime_id = @new_runtime_id
 WHERE runtime_id = @old_runtime_id;
 
