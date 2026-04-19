@@ -1265,6 +1265,39 @@ func createRuntimeGroupWithMembers(t *testing.T, name string, runtimeIDs []strin
 	return groupID
 }
 
+// createAgentWithRuntimesAndGroups creates an agent via the CreateAgent handler
+// with the given runtimeIDs and groupIDs. Returns the agent UUID string.
+// Registers a t.Cleanup to delete the agent.
+func createAgentWithRuntimesAndGroups(t *testing.T, runtimeIDs, groupIDs []string) string {
+	t.Helper()
+	// Pick a unique suffix from available IDs.
+	suffix := "groups"
+	if len(runtimeIDs) > 0 {
+		suffix = runtimeIDs[0][:8]
+	} else if len(groupIDs) > 0 {
+		suffix = groupIDs[0][:8]
+	}
+	body := map[string]any{
+		"name":                 "test-agent-" + suffix,
+		"runtime_ids":          runtimeIDs,
+		"group_ids":            groupIDs,
+		"visibility":           "private",
+		"max_concurrent_tasks": 1,
+	}
+	w := httptest.NewRecorder()
+	testHandler.CreateAgent(w, newRequest(http.MethodPost, "/api/agents", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("createAgentWithRuntimesAndGroups: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.NewDecoder(w.Body).Decode(&resp)
+	agentID := resp["id"].(string)
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID)
+	})
+	return agentID
+}
+
 // newRequestWithParam wraps newRequest and injects a chi URL parameter.
 func newRequestWithParam(method, path string, body any, paramKey, paramValue string) *http.Request {
 	req := newRequest(method, path, body)
